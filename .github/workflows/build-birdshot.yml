@@ -1,147 +1,125 @@
 name: Build & Publish Birdshot Extension
 
+# Builds birdshot for every default DuckDB target and publishes to Cloudflare R2.
+#
+# Build is delegated to DuckDB's official reusable workflow
+# (duckdb/extension-ci-tools) so vcpkg handles OpenSSL + cross-compilation +
+# emscripten + MSVC correctly on every platform — hand-rolling that (esp. wasm,
+# mingw, and cross-compiled osx_amd64) is not maintainable.
+#
+# With no exclude_archs, the matrix builds all targets flagged opt_in:false in
+# extension-ci-tools/config/distribution_matrix.json:
+#   linux_amd64, linux_arm64, osx_amd64, osx_arm64,
+#   windows_amd64, windows_amd64_mingw, wasm_mvp, wasm_eh, wasm_threads
+#
+# R2 layout (served via CDN at https://ext.duckbase.io):
+#   native: v1.5.3/<platform>/birdshot.duckdb_extension.gz            (gzip)
+#   wasm:   duckdb-wasm/v1.5.3/<platform>/birdshot.duckdb_extension.wasm
+# The duckdb-wasm/ prefix + .wasm suffix is what the DuckDB-Wasm loader expects.
+
 on:
   push:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      duckdb_version:
-        description: 'DuckDB version override (e.g. v1.5.3)'
-        required: false
+
+permissions:
+  contents: read
 
 env:
   DUCKDB_VERSION: v1.5.3
   R2_BUCKET: duckbase-ext
 
 jobs:
+  # ── Build all platforms via DuckDB's reusable workflow ───────────────────────
   build:
-    name: Build (${{ matrix.platform }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux_amd64
-            runner: ubuntu-24.04
+    name: Build
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@a00c74e02aefbfa3fd31a4c74c4b6bc260af0de7
+    with:
+      extension_name: birdshot
+      duckdb_version: v1.5.3
+      # Pin ci_tools to the same commit our submodule tracks (origin/main @ 2026-06-04).
+      ci_tools_version: a00c74e02aefbfa3fd31a4c74c4b6bc260af0de7
+      # vcpkg commit pinned by DuckDB v1.5.3 (duckdb/.github/workflows/Main.yml).
+      vcpkg_commit: 84bab45d415d22042bd0b9081aea57f362da3f35
+      # Tests assume the gateway/JWT control-plane context; skip in the build CI.
+      skip_tests: true
 
-          - platform: linux_arm64
-            runner: ubuntu-24.04-arm
-
-          - platform: osx_arm64
-            runner: macos-latest
-            osx_build_arch: arm64
-
-          - platform: osx_amd64
-            runner: macos-latest
-            osx_build_arch: x86_64
-            vcpkg_target_triplet: x64-osx-release
-            vcpkg_host_triplet: arm64-osx-release
-
-    runs-on: ${{ matrix.runner }}
-
+  # ── Publish every artifact to Cloudflare R2 ──────────────────────────────────
+  publish:
+    name: Publish to R2
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      # R2 rejects the default streaming checksum trailer the AWS CLI v2 now sends.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
     steps:
-      - name: Checkout (with submodules)
-        uses: actions/checkout@v4
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
         with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Install build dependencies (Linux)
-        if: startsWith(matrix.runner, 'ubuntu')
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build gcc g++ make \
-            python3 zip unzip curl libssl-dev
-
-      - name: Install build dependencies (macOS)
-        if: matrix.runner == 'macos-latest'
-        run: |
-          brew install cmake ninja openssl
-
-      # Cache vcpkg: key on vcpkg.json + platform so it's invalidated when deps change.
-      - name: Cache vcpkg packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/vcpkg
-            build/vcpkg_installed
-            duckdb/build/vcpkg_installed
-          key: vcpkg-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-${{ matrix.platform }}-
-
-      # Cache the DuckDB build so rebuilds on the same runner are fast.
-      - name: Cache DuckDB build
-        uses: actions/cache@v4
-        with:
-          path: duckdb/build
-          key: duckdb-build-${{ env.DUCKDB_VERSION }}-${{ matrix.platform }}-${{ hashFiles('duckdb/CMakeLists.txt') }}
-          restore-keys: |
-            duckdb-build-${{ env.DUCKDB_VERSION }}-${{ matrix.platform }}-
-
-      - name: Build (Linux)
-        if: startsWith(matrix.runner, 'ubuntu')
-        run: GEN=ninja make release
-
-      - name: Build (macOS arm64)
-        if: matrix.runner == 'macos-latest' && matrix.osx_build_arch == 'arm64'
-        run: GEN=ninja OSX_BUILD_ARCH=arm64 make release
-
-      - name: Build (macOS amd64 cross-compile)
-        if: matrix.runner == 'macos-latest' && matrix.osx_build_arch == 'x86_64'
-        run: |
-          GEN=ninja \
-          OSX_BUILD_ARCH=x86_64 \
-          VCPKG_TARGET_TRIPLET=x64-osx-release \
-          VCPKG_HOST_TRIPLET=arm64-osx-release \
-          make release
-
-      - name: Gzip extension binary
-        run: |
-          EXT=build/release/extension/birdshot/birdshot.duckdb_extension
-          mkdir -p dist/${{ matrix.platform }}
-          gzip -c "${EXT}" > dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz
-          echo "Compressed: $(du -sh dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz)"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: birdshot-${{ matrix.platform }}
-          path: dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz
-          retention-days: 14
-          if-no-files-found: error
+          path: artifacts
+          pattern: birdshot-${{ env.DUCKDB_VERSION }}-extension-*
 
       - name: Publish to Cloudflare R2
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         run: |
-          VERSION="${{ github.event.inputs.duckdb_version || env.DUCKDB_VERSION }}"
-          DEST="s3://${R2_BUCKET}/${VERSION}/${{ matrix.platform }}/birdshot.duckdb_extension.gz"
-          aws s3 cp \
-            dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz \
-            "${DEST}" \
-            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
-            --no-progress
-          echo "Published: ${DEST}"
+          set -euo pipefail
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          VERSION="${DUCKDB_VERSION}"
+          shopt -s nullglob
 
-  # After all platform builds succeed on main/tag, emit the canonical install URL.
-  publish-summary:
-    name: Summary
-    needs: build
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    steps:
-      - name: Print install URL
+          published=0
+          for dir in artifacts/birdshot-${VERSION}-extension-*/; do
+            arch="${dir#*-extension-}"; arch="${arch%/}"
+
+            if [[ "$arch" == wasm_* ]]; then
+              # WASM: served raw at duckdb-wasm/<ver>/<platform>/...wasm.
+              # The browser loader fetches this directly; Cloudflare handles
+              # transfer compression. Content-Type must be application/wasm.
+              src="${dir}birdshot.duckdb_extension.wasm"
+              dest="s3://${R2_BUCKET}/duckdb-wasm/${VERSION}/${arch}/birdshot.duckdb_extension.wasm"
+              aws s3 cp "$src" "$dest" \
+                --endpoint-url "$ENDPOINT" \
+                --content-type "application/wasm" \
+                --no-progress
+            else
+              # Native: gzip then upload to <ver>/<platform>/...gz.
+              src="${dir}birdshot.duckdb_extension"
+              gzip -c "$src" > /tmp/${arch}.gz
+              dest="s3://${R2_BUCKET}/${VERSION}/${arch}/birdshot.duckdb_extension.gz"
+              aws s3 cp "/tmp/${arch}.gz" "$dest" \
+                --endpoint-url "$ENDPOINT" \
+                --content-type "application/octet-stream" \
+                --no-progress
+            fi
+            echo "Published: ${dest}"
+            published=$((published + 1))
+          done
+
+          if [[ "${published}" -eq 0 ]]; then
+            echo "ERROR: no artifacts found to publish" >&2
+            exit 1
+          fi
+          echo "PUBLISHED_COUNT=${published}" >> "$GITHUB_ENV"
+
+      - name: Summary
         run: |
-          echo "## Birdshot published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```sql' >> $GITHUB_STEP_SUMMARY
-          echo "SET allow_unsigned_extensions = true;" >> $GITHUB_STEP_SUMMARY
-          echo "INSTALL birdshot FROM 'https://ext.duckbase.io';" >> $GITHUB_STEP_SUMMARY
-          echo "LOAD birdshot;" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Birdshot published to R2 (${PUBLISHED_COUNT} targets)"
+            echo ""
+            echo "**Native install:**"
+            echo '```sql'
+            echo "SET allow_unsigned_extensions = true;"
+            echo "INSTALL birdshot FROM 'https://ext.duckbase.io';"
+            echo "LOAD birdshot;"
+            echo '```'
+            echo ""
+            echo "**DuckDB-Wasm** (autoloads from custom repo):"
+            echo '```sql'
+            echo "SET custom_extension_repository = 'https://ext.duckbase.io';"
+            echo "LOAD birdshot;"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
