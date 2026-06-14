@@ -1,0 +1,220 @@
+# name: test/sql/birdshot.test
+# description: birdshot auth/authz hooks, ACL, revocation, audit (dev mode)
+# group: [sql]
+
+# Functions don't exist before the extension is loaded.
+statement error
+SELECT birdshot_status();
+----
+Catalog Error
+
+require birdshot
+
+# ---- configure (dev mode: JWT claims trusted without signature) -------------
+
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+# role 'reader' may read main.todos; 'peer' service token maps to it.
+query I
+SELECT birdshot_add_role_grant('reader', 'main.todos', 'read');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('alice', 'reader');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('svc-token-123', 'alice');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+query I
+SELECT birdshot_status() LIKE 'mode=dev%';
+----
+true
+
+# ---- authentication ---------------------------------------------------------
+
+# Static service token authenticates as user 'alice'.
+query I
+SELECT birdshot_authenticate('sess1', 'svc-token-123', 'ignored');
+----
+true
+
+# A dev-mode user JWT { "sub": "alice" } also authenticates.
+query I
+SELECT birdshot_authenticate('sess2', 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhbGljZSJ9.x', '');
+----
+true
+
+# Garbage token is rejected.
+query I
+SELECT birdshot_authenticate('sess3', 'not-a-token', '');
+----
+false
+
+# ---- authorization ----------------------------------------------------------
+
+# Granted read on main.todos -> allow.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM main.todos');
+----
+true
+
+# Unqualified todos matches the grant by suffix -> allow.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT count(*) FROM todos');
+----
+true
+
+# A table with no grant -> deny.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM secrets');
+----
+false
+
+# Write to a read-only granted table -> deny.
+query I
+SELECT birdshot_authorize('sess1', 'INSERT INTO main.todos VALUES (1)');
+----
+false
+
+# Forbidden statement class (could subvert the sandbox) -> deny.
+query I
+SELECT birdshot_authorize('sess1', 'ATTACH ''evil.db'' AS x');
+----
+false
+
+# Zero-table / introspection statement -> allowed (federation handshake).
+query I
+SELECT birdshot_authorize('sess1', 'SELECT 42');
+----
+true
+
+# A non-granted table hidden in a WHERE subquery must NOT slip through.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM main.todos WHERE id IN (SELECT id FROM secrets)');
+----
+false
+
+# A forbidden statement hidden after a benign one in a batch must NOT slip through.
+query I
+SELECT birdshot_authorize('sess1', 'BEGIN; DROP TABLE main.todos');
+----
+false
+
+# A peer must NOT be able to call birdshot's own mutators (zero-table SELECT).
+query I
+SELECT birdshot_authorize('sess1', 'SELECT birdshot_revoke(''user'', ''admin'', '''', NULL)');
+----
+false
+
+query I
+SELECT birdshot_authorize('sess1', 'SELECT birdshot_add_role_grant(''peer'', ''*'', ''write'')');
+----
+false
+
+# File / dynamic readers must be denied (arbitrary file read / SSRF).
+query I
+SELECT birdshot_authorize('sess1', 'SELECT read_blob(''/etc/passwd'')');
+----
+false
+
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM read_csv(''/etc/passwd'')');
+----
+false
+
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM query_table(''secrets'')');
+----
+false
+
+# A dangerous reader hidden in a WHERE subquery is still caught.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM main.todos WHERE title = read_text(''/etc/hostname'')');
+----
+false
+
+# EXPLAIN ANALYZE executes its child -> the child is ACL-checked, not waved through.
+query I
+SELECT birdshot_authorize('sess1', 'EXPLAIN ANALYZE SELECT * FROM secrets');
+----
+false
+
+# Introspection table functions stay allowed (quack ATTACH handshake needs these).
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM duckdb_tables()');
+----
+true
+
+# PRAGMA is denied (reparses into statements that skip re-authorize; some pragmas
+# reach settings / file-write primitives).
+query I
+SELECT birdshot_authorize('sess1', 'PRAGMA table_info(''main.todos'')');
+----
+false
+
+# A CAST to an autoload-backed type (json/spatial/inet) is denied even on a
+# granted table — it can pull in an extension at bind time.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT CAST(title AS JSON) FROM main.todos');
+----
+false
+
+# Unknown session -> deny.
+query I
+SELECT birdshot_authorize('ghost', 'SELECT * FROM main.todos');
+----
+false
+
+# ---- instant revocation -----------------------------------------------------
+
+query I
+SELECT birdshot_revoke('user', 'alice', 'compromised', NULL);
+----
+ok
+
+# alice's existing session is cut off on her next query.
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM main.todos');
+----
+false
+
+query I
+SELECT birdshot_unrevoke('user', 'alice');
+----
+ok
+
+query I
+SELECT birdshot_authorize('sess1', 'SELECT * FROM main.todos');
+----
+true
+
+# ---- audit drain ------------------------------------------------------------
+
+# Every auth/authz call above logged an entry; draining returns them and clears.
+query I
+SELECT length(birdshot_log_drain(1000)) > 0;
+----
+true
+
+query I
+SELECT length(birdshot_log_drain(1000));
+----
+0

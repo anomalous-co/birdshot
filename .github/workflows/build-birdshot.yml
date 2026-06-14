@@ -1,0 +1,147 @@
+name: Build & Publish Birdshot Extension
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      duckdb_version:
+        description: 'DuckDB version override (e.g. v1.5.3)'
+        required: false
+
+env:
+  DUCKDB_VERSION: v1.5.3
+  R2_BUCKET: duckbase-ext
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-24.04
+
+          - platform: linux_arm64
+            runner: ubuntu-24.04-arm
+
+          - platform: osx_arm64
+            runner: macos-latest
+            osx_build_arch: arm64
+
+          - platform: osx_amd64
+            runner: macos-latest
+            osx_build_arch: x86_64
+            vcpkg_target_triplet: x64-osx-release
+            vcpkg_host_triplet: arm64-osx-release
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies (Linux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build gcc g++ make \
+            python3 zip unzip curl libssl-dev
+
+      - name: Install build dependencies (macOS)
+        if: matrix.runner == 'macos-latest'
+        run: |
+          brew install cmake ninja openssl
+
+      # Cache vcpkg: key on vcpkg.json + platform so it's invalidated when deps change.
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/vcpkg
+            build/vcpkg_installed
+            duckdb/build/vcpkg_installed
+          key: vcpkg-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-${{ matrix.platform }}-
+
+      # Cache the DuckDB build so rebuilds on the same runner are fast.
+      - name: Cache DuckDB build
+        uses: actions/cache@v4
+        with:
+          path: duckdb/build
+          key: duckdb-build-${{ env.DUCKDB_VERSION }}-${{ matrix.platform }}-${{ hashFiles('duckdb/CMakeLists.txt') }}
+          restore-keys: |
+            duckdb-build-${{ env.DUCKDB_VERSION }}-${{ matrix.platform }}-
+
+      - name: Build (Linux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: GEN=ninja make release
+
+      - name: Build (macOS arm64)
+        if: matrix.runner == 'macos-latest' && matrix.osx_build_arch == 'arm64'
+        run: GEN=ninja OSX_BUILD_ARCH=arm64 make release
+
+      - name: Build (macOS amd64 cross-compile)
+        if: matrix.runner == 'macos-latest' && matrix.osx_build_arch == 'x86_64'
+        run: |
+          GEN=ninja \
+          OSX_BUILD_ARCH=x86_64 \
+          VCPKG_TARGET_TRIPLET=x64-osx-release \
+          VCPKG_HOST_TRIPLET=arm64-osx-release \
+          make release
+
+      - name: Gzip extension binary
+        run: |
+          EXT=build/release/extension/birdshot/birdshot.duckdb_extension
+          mkdir -p dist/${{ matrix.platform }}
+          gzip -c "${EXT}" > dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz
+          echo "Compressed: $(du -sh dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz)"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: birdshot-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish to Cloudflare R2
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          VERSION="${{ github.event.inputs.duckdb_version || env.DUCKDB_VERSION }}"
+          DEST="s3://${R2_BUCKET}/${VERSION}/${{ matrix.platform }}/birdshot.duckdb_extension.gz"
+          aws s3 cp \
+            dist/${{ matrix.platform }}/birdshot.duckdb_extension.gz \
+            "${DEST}" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+            --no-progress
+          echo "Published: ${DEST}"
+
+  # After all platform builds succeed on main/tag, emit the canonical install URL.
+  publish-summary:
+    name: Summary
+    needs: build
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    steps:
+      - name: Print install URL
+        run: |
+          echo "## Birdshot published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```sql' >> $GITHUB_STEP_SUMMARY
+          echo "SET allow_unsigned_extensions = true;" >> $GITHUB_STEP_SUMMARY
+          echo "INSTALL birdshot FROM 'https://ext.duckbase.io';" >> $GITHUB_STEP_SUMMARY
+          echo "LOAD birdshot;" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
