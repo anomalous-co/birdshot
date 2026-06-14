@@ -1,0 +1,95 @@
+name: Publish Birdshot to R2 (from existing run)
+
+# Manually publish already-built artifacts from a previous build run to R2,
+# without rebuilding. Useful when a build run partially failed (e.g. windows)
+# but the other targets uploaded their artifacts successfully.
+#
+# Usage:
+#   gh workflow run publish-r2.yml -f run_id=<BUILD_RUN_ID>
+#
+# It downloads every birdshot-<version>-extension-* artifact present in that
+# run (missing/failed targets are simply absent) and pushes each to R2 using
+# the same native/wasm layout as build-birdshot.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run ID to pull artifacts from'
+        required: true
+        type: string
+      duckdb_version:
+        description: 'DuckDB version (R2 path segment)'
+        required: false
+        type: string
+        default: v1.5.3
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  DUCKDB_VERSION: ${{ inputs.duckdb_version }}
+  R2_BUCKET: duckbase-ext
+
+jobs:
+  publish:
+    name: Publish to R2
+    runs-on: ubuntu-24.04
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+    steps:
+      - name: Download artifacts from build run
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: birdshot-${{ inputs.duckdb_version }}-extension-*
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to Cloudflare R2
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          VERSION="${DUCKDB_VERSION}"
+          shopt -s nullglob
+
+          published=0
+          for dir in artifacts/birdshot-${VERSION}-extension-*/; do
+            arch="${dir#*-extension-}"; arch="${arch%/}"
+
+            if [[ "$arch" == wasm_* ]]; then
+              src="${dir}birdshot.duckdb_extension.wasm"
+              dest="s3://${R2_BUCKET}/duckdb-wasm/${VERSION}/${arch}/birdshot.duckdb_extension.wasm"
+              aws s3 cp "$src" "$dest" \
+                --endpoint-url "$ENDPOINT" \
+                --content-type "application/wasm" \
+                --no-progress
+            else
+              src="${dir}birdshot.duckdb_extension"
+              gzip -c "$src" > /tmp/${arch}.gz
+              dest="s3://${R2_BUCKET}/${VERSION}/${arch}/birdshot.duckdb_extension.gz"
+              aws s3 cp "/tmp/${arch}.gz" "$dest" \
+                --endpoint-url "$ENDPOINT" \
+                --content-type "application/octet-stream" \
+                --no-progress
+            fi
+            echo "Published: ${dest}"
+            published=$((published + 1))
+          done
+
+          if [[ "${published}" -eq 0 ]]; then
+            echo "ERROR: no artifacts found in run ${{ inputs.run_id }}" >&2
+            exit 1
+          fi
+          echo "PUBLISHED_COUNT=${published}" >> "$GITHUB_ENV"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Birdshot published to R2 (${PUBLISHED_COUNT} targets)"
+            echo "From build run: ${{ inputs.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
