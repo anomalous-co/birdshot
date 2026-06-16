@@ -218,3 +218,479 @@ query I
 SELECT length(birdshot_log_drain(1000));
 ----
 0
+
+# ---- column + time-window constraint enforcement ----------------------------
+#
+# Real tables so positional refs (#N) resolve against the catalog. sqllogictest's
+# default catalog is 'memory'; constraints resolve unqualified `FROM t` there.
+
+statement ok
+CREATE TABLE t(c1 INT, c2 INT, c3 INT, c4 INT, c5 INT GENERATED ALWAYS AS (c1 + 1));
+
+statement ok
+CREATE TABLE t2(c1 INT, c2 INT, c3 INT, c4 INT);
+
+statement ok
+CREATE TABLE win_tbl(c1 INT, c2 INT);
+
+# Fresh config: bob may read t, t2, win_tbl; t is column-restricted to {c1,c2};
+# win_tbl carries an all-day window (deterministic). t2 is unconstrained.
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+query I
+SELECT birdshot_set_lake_catalog('memory');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('colrole', 'main.t', 'read');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('colrole', 'main.t2', 'read');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('colrole', 'main.win_tbl', 'read');
+----
+ok
+
+# Write grants so the DML (R6) cases reach column enforcement rather than
+# denying at the table-grant stage. The {c1,c2} column constraint on main.t
+# still applies to writes (column allow-lists are not action-scoped).
+query I
+SELECT birdshot_add_role_grant('colrole', 'main.t', 'write');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('colrole', 'main.t2', 'write');
+----
+ok
+
+query I
+SELECT birdshot_add_grant_constraint('colrole', 'main.t', 'c1,c2', '', '');
+----
+ok
+
+# All-day window -> always in-window (deterministic, not wall-clock-flaky).
+query I
+SELECT birdshot_add_grant_constraint('colrole', 'main.win_tbl', '', '00:00', '23:59');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('bob', 'colrole');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+# Two constraint entries are live (main.t columns, main.win_tbl window).
+query I
+SELECT birdshot_status() LIKE '%constraints=2';
+----
+true
+
+query I
+SELECT birdshot_authenticate('bsess', 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJib2IifQ.x', '');
+----
+true
+
+# Form A (positional push-down): allowed columns -> allow; a non-allowed
+# position (#3 == c3) -> deny; star pre-expanded to #1..#4 -> deny (c3,c4 not allowed).
+query I
+SELECT birdshot_authorize('bsess', 'SELECT #1, #2 FROM t');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT #1, #3 FROM t');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT #1, #2, #3, #4 FROM t');
+----
+false
+
+# Form B (verbatim names via lake.query): allowed names -> allow; non-allowed
+# name -> deny; literal unqualified star -> deny (cannot enumerate).
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1, c2 FROM main.t');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1, c3 FROM main.t');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM main.t');
+----
+false
+
+# A non-allowed column hidden in a WHERE clause is also charged -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t WHERE c3 > 0');
+----
+false
+
+# A non-allowed column referenced only in ORDER BY / GROUP BY is still charged.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t ORDER BY c3');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT count(c1) FROM main.t GROUP BY c3');
+----
+false
+
+# Allowed columns across SELECT + ORDER BY -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t ORDER BY c2');
+----
+true
+
+# Unconstrained table: every column / star is fine.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT #1, #2, #3, #4 FROM t2');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM main.t2');
+----
+true
+
+# Window-only table (no column allow-list): readable in-window via a plain star.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM main.win_tbl');
+----
+true
+
+# ---- walker completeness / fail-closed (adversarial review R1-R8) ------------
+
+# R1: every non-enumerable star variant denies on a column-constrained table.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t.* FROM main.t');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT x.* FROM main.t x');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT COLUMNS(''.*'') FROM main.t');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT COLUMNS(''c[34]'') FROM main.t');
+----
+false
+
+# R1 (no over-deny): COLUMNS(*) over an unconstrained table is fine.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT COLUMNS(''.*'') FROM main.t2');
+----
+true
+
+# R2: PIVOT/UNPIVOT source table is gated. secrets is ungranted -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM secrets UNPIVOT(v FOR n IN (c1, c2))');
+----
+false
+
+# R2 (no over-deny): UNPIVOT over a granted unconstrained table -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM main.t2 UNPIVOT(v FOR n IN (c1, c2))');
+----
+true
+
+# R3: a scalar subquery hidden in a VALUES cell is gated. secrets -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM (VALUES ((SELECT max(c1) FROM secrets))) AS v(c)');
+----
+false
+
+# R3 (no over-deny): a plain VALUES list with no base table -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM (VALUES (1), (2)) AS v(c)');
+----
+true
+
+# R4: WITH RECURSIVE body reads are gated even when the CTE is named after a
+# granted table. The recursive body reads secrets -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'WITH RECURSIVE t2 AS (SELECT c1 FROM secrets UNION SELECT c1 FROM t2) SELECT * FROM t2');
+----
+false
+
+# R5: a forbidden column in a JOIN ON predicate is charged -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t.c1 FROM main.t t JOIN main.t2 x ON t.c3 = x.c1');
+----
+false
+
+# R5 (no over-deny): qualified allowed columns across a join -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t.c1 FROM main.t t JOIN main.t2 x ON t.c2 = x.c1');
+----
+true
+
+# R6: DELETE WHERE referencing an ungranted table via subquery -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'DELETE FROM main.t2 WHERE c1 IN (SELECT c1 FROM secrets)');
+----
+false
+
+# R6: UPDATE ... RETURNING a forbidden column on a constrained table -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'UPDATE main.t SET c1 = 1 RETURNING c3');
+----
+false
+
+# R7 (fail-closed default does NOT over-deny benign tableless / introspection):
+query I
+SELECT birdshot_authorize('bsess', 'SELECT 42');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM duckdb_tables()');
+----
+true
+
+# R8: a forbidden column hidden only inside a LIMIT subquery is charged -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t LIMIT (SELECT c3 FROM main.t)');
+----
+false
+
+# SHOW/DESCRIBE/SUMMARIZE: SUMMARIZE reads all columns of its source and DESCRIBE
+# are their own statement classes -> hit the forbidden-statement default (deny),
+# so they cannot leak ungranted tables or constrained columns. SHOW (no source
+# table) stays allowed for the introspection handshake.
+query I
+SELECT birdshot_authorize('bsess', 'SUMMARIZE secrets');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SUMMARIZE main.t');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'DESCRIBE secrets');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SHOW tables');
+----
+true
+
+# UNPIVOT IN-list columns are collected (they land in pivot_expressions), so c3/c4
+# are charged against the {c1,c2} constraint -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT v FROM main.t UNPIVOT(v FOR n IN (c3, c4))');
+----
+false
+
+# ---- round-2 review fixes (S1-S7) -------------------------------------------
+
+# S1: NATURAL JOIN keys are bind-time invisible -> fail closed on the constrained
+# side. (Use SELECT 1 to avoid NATURAL-coalesce qualification quirks.)
+query I
+SELECT birdshot_authorize('bsess', 'SELECT 1 FROM main.t NATURAL JOIN main.t2');
+----
+false
+
+# S1 (no over-deny): NATURAL JOIN of two unconstrained granted tables -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT 1 FROM main.t2 NATURAL JOIN main.win_tbl');
+----
+true
+
+# S2: a PIVOT IN-list subquery reading an ungranted table is gated -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'PIVOT main.t2 ON c1 IN ((SELECT c1 FROM secrets)) USING sum(c2)');
+----
+false
+
+# S2 (no over-deny): plain IN-list label idents over a granted table -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'PIVOT main.t2 ON c1 IN (1, 2) USING sum(c2)');
+----
+true
+
+# S3: a dangerous CAST hidden in an introspection-fn arg is still caught -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM pragma_table_info(CAST(''x'' AS JSON))');
+----
+false
+
+# S3 (no over-deny): literal-arg / no-arg introspection the handshake needs.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM pragma_table_info(''main.t'')');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM duckdb_columns()');
+----
+true
+
+# S4: per-qualifier stars. A qualified star over a DIFFERENT unconstrained table
+# does NOT deny the constrained table; only a bare star or t.* does.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT x.* FROM main.t t JOIN main.t2 x ON t.c1 = x.c1');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t.* FROM main.t t JOIN main.t2 x ON t.c1 = x.c1');
+----
+false
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM main.t t JOIN main.t2 x ON t.c1 = x.c1');
+----
+false
+
+# S5: a CTE ref is not charged as a phantom ungranted table -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'WITH cte AS (SELECT c1 FROM main.t2) SELECT * FROM cte');
+----
+true
+
+# S5: the CTE body's real reads stay charged -> ungranted secrets -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'WITH cte AS (SELECT s FROM secrets) SELECT * FROM cte');
+----
+false
+
+# S5 scope isolation: a real ungranted base table sharing a name with a CTE
+# declared in a SEPARATE (sibling subquery) scope must still DENY.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM (WITH cte AS (SELECT 1) SELECT 1) q, cte');
+----
+false
+
+# S5 self-shadow (must DENY): a non-recursive CTE cannot reference itself, so the
+# body's `FROM t` is the REAL constrained table — its forbidden c3 must be charged.
+query I
+SELECT birdshot_authorize('bsess', 'WITH t AS (SELECT c3 FROM t) SELECT * FROM t');
+----
+false
+
+# S5 preceding-sibling scope (must ALLOW): a later CTE may reference an earlier one.
+query I
+SELECT birdshot_authorize('bsess', 'WITH a AS (SELECT c1 FROM main.t2), b AS (SELECT c1 FROM a) SELECT c1 FROM b');
+----
+true
+
+# S5 recursive no-over-deny: a RECURSIVE self-ref over a granted unconstrained
+# table must still ALLOW (the self-ref is not charged as a phantom table).
+query I
+SELECT birdshot_authorize('bsess', 'WITH RECURSIVE r AS (SELECT c1 FROM main.t2 UNION SELECT c1 FROM r) SELECT * FROM r');
+----
+true
+
+# S8: multi-table UNQUALIFIED columns resolve via the catalog instead of a blanket
+# ambiguity-deny. An unqualified name in C(main.t) but not in {c1,c2} -> deny;
+# otherwise the multi-table query "just works".
+
+# ALLOW: unqualified allowed column across a join.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+----
+true
+
+# DENY: unqualified forbidden column (c3 in C(main.t), not in allow-list).
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c3 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+----
+false
+
+# S8 subsumes S6: USING(allowed) -> allow, USING(forbidden) -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t.c1 FROM main.t t JOIN main.t2 x USING (c1)');
+----
+true
+
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t.c1 FROM main.t t JOIN main.t2 x USING (c3)');
+----
+false
+
+# WHERE-subquery makes it multi-table; unqualified allowed cols -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t WHERE c2 IN (SELECT c1 FROM main.t2)');
+----
+true
+
+# UNION (multi-table) with allowed unqualified cols -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t UNION SELECT c1 FROM main.t2');
+----
+true
+
+# A qualified column on the UNCONSTRAINED side (c3 is t2's) -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT t2.c3 FROM main.t t JOIN main.t2 t2 ON t.c1 = t2.c1');
+----
+true
+
+# A computed SELECT alias referenced in ORDER BY resolves to no catalog column
+# -> not charged -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 + 1 AS x FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1 ORDER BY x');
+----
+true
+
+# Schema-qualified ref to the constrained table: GetTableName() returns the table
+# component (`t`), so a forbidden schema-qualified col is still caught -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT main.t.c3 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+----
+false
+
+# ...and the allowed schema-qualified analog -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT main.t.c1 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+----
+true
+
+# S8 completeness: a GENERATED column (c5) must be in C(main.t) so an unqualified
+# multi-table ref to it is caught (c5 not in {c1,c2}) -> deny. If this ALLOWs,
+# GetColumnNames() omits generated columns = an under-charge bypass.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c5 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+----
+false
+
+# S7: whoami() is allow-listed as quack node-identity introspection -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM whoami()');
+----
+true

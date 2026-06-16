@@ -10,8 +10,14 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/column_list.hpp"
+#include "duckdb/common/enums/on_entry_not_found.hpp"
 
 #include <chrono>
+#include <ctime>
 #include <sstream>
 
 namespace birdshot {
@@ -21,6 +27,29 @@ namespace birdshot {
 static int64_t NowUs() {
 	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
 	    .count();
+}
+
+// Current UTC minutes-of-day [0,1439] for time-window enforcement. Uses gmtime
+// (UTC) — constraint windows are specified in UTC.
+static int32_t NowMinutesUtc() {
+	std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+	std::tm out;
+#if defined(_WIN32)
+	gmtime_s(&out, &t);
+#else
+	gmtime_r(&t, &out);
+#endif
+	return static_cast<int32_t>(out.tm_hour * 60 + out.tm_min);
+}
+
+// Inside a (possibly wrapping) [start,end] minute window, inclusive. Caller
+// guarantees start >= 0 (a window is configured).
+static bool WithinWindow(int32_t now, int32_t start, int32_t end) {
+	if (end < 0)
+		end = start; // half-configured window: treat as a single-minute window
+	if (start <= end)
+		return now >= start && now <= end;
+	return now >= start || now <= end; // wraps past midnight
 }
 
 void State::ResetStaging() {
@@ -44,6 +73,21 @@ void State::AddJwk(const std::string &kid, const std::string &n, const std::stri
 void State::AddRoleGrant(const std::string &role, const std::string &table_ref, bool write) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	staging_.role_grants[role].push_back({LowerCopy(table_ref), write});
+}
+void State::AddGrantConstraint(const std::string &role, const std::string &table_ref,
+                               const std::vector<std::string> &columns,
+                               int32_t window_start_min, int32_t window_end_min) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	GrantConstraint c;
+	c.table_ref = LowerCopy(table_ref); // mirror AddRoleGrant's lowercasing invariant
+	c.columns = columns;                // already lowercased by the setter fn
+	c.window_start_min = window_start_min;
+	c.window_end_min = window_end_min;
+	staging_.role_constraints[role].push_back(c);
+}
+void State::SetLakeCatalog(const std::string &name) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	staging_.lake_catalog = name;
 }
 void State::AddUserRole(const std::string &user_id, const std::string &role) {
 	std::lock_guard<std::mutex> lk(mtx_);
@@ -136,6 +180,23 @@ std::vector<Grant> State::GrantsForUser(const std::string &user_id) {
 	}
 	return out;
 }
+std::vector<GrantConstraint> State::ConstraintsForUser(const std::string &user_id) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	std::vector<GrantConstraint> out;
+	auto it = live_.user_roles.find(user_id);
+	if (it == live_.user_roles.end())
+		return out;
+	for (const auto &role : it->second) {
+		auto cit = live_.role_constraints.find(role);
+		if (cit != live_.role_constraints.end())
+			out.insert(out.end(), cit->second.begin(), cit->second.end());
+	}
+	return out;
+}
+std::string State::LakeCatalog() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return live_.lake_catalog;
+}
 AuthMode State::Mode() {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return live_.mode;
@@ -187,9 +248,13 @@ std::string State::StatusSummary() {
 	std::lock_guard<std::mutex> lk(mtx_);
 	std::ostringstream os;
 	const char *m = live_.mode == AuthMode::DEV ? "dev" : live_.mode == AuthMode::HS256 ? "hs256" : "rs256";
+	size_t constraints = 0;
+	for (const auto &kv : live_.role_constraints)
+		constraints += kv.second.size();
 	os << "mode=" << m << " issuer=" << live_.issuer << " roles=" << live_.role_grants.size()
 	   << " users=" << live_.user_roles.size() << " jwks=" << live_.jwks.size() << " sessions=" << sessions_.size()
-	   << " deny_user=" << deny_user_.size() << " deny_jti=" << deny_jti_.size() << " audit=" << audit_.size();
+	   << " deny_user=" << deny_user_.size() << " deny_jti=" << deny_jti_.size() << " audit=" << audit_.size()
+	   << " constraints=" << constraints;
 	return os.str();
 }
 
@@ -296,6 +361,157 @@ static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result
 	}
 }
 
+// Resolve a base table's full (lowercased) column-name list against the lake
+// catalog. Returns false (fail-closed) on missing context or unknown
+// catalog/schema/table. `lake_catalog` may be empty, in which case the ref's own
+// catalog (or DuckDB's default search path) is used. The result is the catalog
+// column SET C(use), reused for both positional resolution (#N -> names[N-1]) and
+// S8 unqualified-name membership tests.
+static bool ResolveTableColumns(ExpressionState &state, const std::string &lake_catalog, const TableUse &use,
+                                std::vector<std::string> &out_names) {
+	if (!state.HasContext())
+		return false;
+	std::string catalog = !use.catalog.empty() ? use.catalog : lake_catalog;
+	std::string schema = !use.schema.empty() ? use.schema : "main";
+	try {
+		ClientContext &ctx = state.GetContext();
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(ctx, catalog, schema, use.table,
+		                                                  OnEntryNotFound::RETURN_NULL);
+		if (!entry)
+			return false;
+		const ColumnList &cols = entry->GetColumns();
+		vector<std::string> names = cols.GetColumnNames();
+		out_names.clear();
+		out_names.reserve(names.size());
+		for (auto &n : names)
+			out_names.push_back(LowerCopy(n));
+		return true;
+	} catch (...) {
+		return false; // unknown catalog/schema, etc. -> deny
+	}
+}
+
+// Enforce column allow-lists + time windows for the touched tables. Returns true
+// iff every constraint is satisfied; sets `reason` (col:<ref> / window:<ref>) on
+// the first deny. Fails closed on any ambiguity or unresolved column.
+static bool EnforceConstraints(const AclAnalysis &a, const std::vector<GrantConstraint> &constraints,
+                               const std::string &lake_catalog, ExpressionState &state, std::string &reason) {
+	if (constraints.empty())
+		return true;
+
+	int n_tables = static_cast<int>(a.tables.size());
+	int32_t now_min = -1; // computed lazily, once
+
+	for (const auto &use : a.tables) {
+		for (const auto &c : constraints) {
+			if (!RefMatch(c.table_ref, use.ref))
+				continue;
+
+			// ---- time window (clock-based; independent of query form) ----------
+			if (c.window_start_min >= 0) {
+				if (now_min < 0)
+					now_min = NowMinutesUtc();
+				if (!WithinWindow(now_min, c.window_start_min, c.window_end_min)) {
+					reason = std::string("window:") + use.ref;
+					return false;
+				}
+			}
+
+			// ---- column allow-list ---------------------------------------------
+			if (c.columns.empty())
+				continue; // unrestricted columns
+
+			std::unordered_map<std::string, bool> allowed;
+			for (const auto &col : c.columns)
+				allowed[col] = true;
+
+			// A non-fully-enumerated star can't be checked against the allow-list.
+			// Deny only the table this star could actually read: a bare star (empty
+			// qualifier) denies every constrained table; a `t.*` denies only the
+			// table aliased `t`. A star qualified to a DIFFERENT table is harmless.
+			for (const auto &sq : a.star_quals) {
+				if (sq.empty() || sq == use.alias) {
+					reason = std::string("col:") + use.ref;
+					return false;
+				}
+			}
+
+			// Catalog column set C(use), resolved lazily on first need and cached, so
+			// a fully-qualified statement that needs no resolution never depends on
+			// catalog availability. resolved: 0=not yet, 1=ok, -1=lookup failed.
+			std::vector<std::string> use_cols;
+			int resolved = 0;
+			auto ensure_cols = [&]() -> bool {
+				if (resolved == 0)
+					resolved = ResolveTableColumns(state, lake_catalog, use, use_cols) ? 1 : -1;
+				return resolved == 1;
+			};
+
+			if (n_tables == 1) {
+				// Single base table: every collected column/position is charged here.
+				for (const auto &col : a.columns) {
+					if (allowed.find(col.name) == allowed.end()) {
+						reason = std::string("col:") + use.ref;
+						return false;
+					}
+				}
+				for (int64_t pos : a.positions) {
+					if (!ensure_cols()) {
+						reason = std::string("col:") + use.ref;
+						return false;
+					}
+					size_t idx = pos < 1 ? use_cols.size() : static_cast<size_t>(pos - 1);
+					if (idx >= use_cols.size() || allowed.find(use_cols[idx]) == allowed.end()) {
+						reason = std::string("col:") + use.ref;
+						return false;
+					}
+				}
+			} else {
+				// Multiple base tables. A select-list positional ref is ambiguous /
+				// exotic in a multi-table statement (form-A pushdown is single-table
+				// only) -> fail closed. (Residual: an ORDER BY 1 / GROUP BY 1 output-
+				// ordinal also denies here; agents use the named form.)
+				if (!a.positions.empty()) {
+					reason = std::string("col:") + use.ref;
+					return false;
+				}
+				for (const auto &col : a.columns) {
+					if (!col.qualifier.empty()) {
+						// Qualified: GetTableName() returns the TABLE component even for
+						// a schema-qualified `main.t.c3` (so it matches use.alias).
+						if (col.qualifier != use.alias)
+							continue; // charged to a different table
+						if (allowed.find(col.name) == allowed.end()) {
+							reason = std::string("col:") + use.ref;
+							return false;
+						}
+						continue;
+					}
+					// Unqualified (S8): the name could read ANY touched table that has a
+					// column by this name. If it IS one of this constrained table's
+					// columns and is NOT allowed -> deny. If it's not this table's column
+					// (alias / computed output / another table's column) -> skip for use.
+					if (!ensure_cols()) {
+						reason = std::string("col:") + use.ref;
+						return false;
+					}
+					bool in_table = false;
+					for (const auto &cn : use_cols)
+						if (cn == col.name) {
+							in_table = true;
+							break;
+						}
+					if (in_table && allowed.find(col.name) == allowed.end()) {
+						reason = std::string("col:") + use.ref;
+						return false;
+					}
+				}
+			}
+		}
+	}
+	return true;
+}
+
 // birdshot_authorize(sid, query) -> BOOLEAN
 static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 	args.data[0].Flatten(args.size());
@@ -344,6 +560,13 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 						break;
 					}
 				}
+				// Then the finer-grained constraints (column allow-lists + time
+				// windows) layered on top of the table grants.
+				if (all_ok) {
+					auto constraints = st.ConstraintsForUser(id.user_id);
+					if (!EnforceConstraints(a, constraints, st.LakeCatalog(), state, reason))
+						all_ok = false;
+				}
 				allow = all_ok;
 				if (allow)
 					reason = "ok";
@@ -365,6 +588,52 @@ static AuthMode ParseMode(const std::string &m) {
 	if (m == "hs256")
 		return AuthMode::HS256;
 	return AuthMode::DEV;
+}
+
+// Parse 'HH:MM' or 'HH:MM:SS' (UTC) to minutes-of-day [0,1439]. Returns -1 for
+// empty or malformed input (so the caller treats it as "no window").
+static int32_t ParseHhMmToMinutes(const std::string &s) {
+	if (s.empty())
+		return -1;
+	// HH:MM (5) or HH:MM:SS (8); only the HH:MM portion contributes to minutes.
+	if (s.size() != 5 && s.size() != 8)
+		return -1;
+	if (s[2] != ':')
+		return -1;
+	if (s.size() == 8 && s[5] != ':')
+		return -1;
+	for (size_t i = 0; i < s.size(); i++) {
+		if (i == 2 || i == 5)
+			continue;
+		if (s[i] < '0' || s[i] > '9')
+			return -1;
+	}
+	int hh = (s[0] - '0') * 10 + (s[1] - '0');
+	int mm = (s[3] - '0') * 10 + (s[4] - '0');
+	if (hh < 0 || hh > 23 || mm < 0 || mm > 59)
+		return -1;
+	return static_cast<int32_t>(hh * 60 + mm);
+}
+
+// Split a comma-separated list, trim ASCII spaces, drop empties, lowercase each.
+static std::vector<std::string> ParseColumnsCsv(const std::string &csv) {
+	std::vector<std::string> out;
+	size_t start = 0;
+	while (start <= csv.size()) {
+		size_t comma = csv.find(',', start);
+		size_t end = comma == std::string::npos ? csv.size() : comma;
+		size_t a = start, b = end;
+		while (a < b && csv[a] == ' ')
+			a++;
+		while (b > a && csv[b - 1] == ' ')
+			b--;
+		if (b > a)
+			out.push_back(LowerCopy(csv.substr(a, b - a)));
+		if (comma == std::string::npos)
+			break;
+		start = comma + 1;
+	}
+	return out;
 }
 
 static void ResetConfig(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -406,6 +675,32 @@ static void AddRoleGrantFn(DataChunk &args, ExpressionState &state, Vector &resu
 	for (idx_t i = 0; i < args.size(); i++) {
 		std::string action = ArgStr(args.data[2], i);
 		State::Get().AddRoleGrant(ArgStr(args.data[0], i), ArgStr(args.data[1], i), action == "write");
+		SetStrResult(result, i, "ok");
+	}
+}
+// birdshot_add_grant_constraint(role, table_ref, columns_csv, window_start, window_end) -> 'ok'
+// Row caps are intentionally absent (see GrantConstraint / contract C1b).
+static void AddGrantConstraintFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 5; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		std::string role = ArgStr(args.data[0], i);
+		std::string table_ref = ArgStr(args.data[1], i);
+		std::string columns_csv = ArgNull(args.data[2], i) ? "" : ArgStr(args.data[2], i);
+		std::string ws = ArgNull(args.data[3], i) ? "" : ArgStr(args.data[3], i);
+		std::string we = ArgNull(args.data[4], i) ? "" : ArgStr(args.data[4], i);
+		State::Get().AddGrantConstraint(role, table_ref, ParseColumnsCsv(columns_csv),
+		                                ParseHhMmToMinutes(ws), ParseHhMmToMinutes(we));
+		SetStrResult(result, i, "ok");
+	}
+}
+// birdshot_set_lake_catalog(name) -> 'ok'
+static void SetLakeCatalogFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	args.data[0].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		State::Get().SetLakeCatalog(ArgNull(args.data[0], i) ? "" : ArgStr(args.data[0], i));
 		SetStrResult(result, i, "ok");
 	}
 }
@@ -510,6 +805,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "birdshot_set_secret", {V}, V, SetSecretFn);
 	Register(loader, "birdshot_add_jwk", {V, V, V}, V, AddJwkFn);
 	Register(loader, "birdshot_add_role_grant", {V, V, V}, V, AddRoleGrantFn);
+	Register(loader, "birdshot_add_grant_constraint", {V, V, V, V, V}, V, AddGrantConstraintFn);
+	Register(loader, "birdshot_set_lake_catalog", {V}, V, SetLakeCatalogFn);
 	Register(loader, "birdshot_add_user_role", {V, V}, V, AddUserRoleFn);
 	Register(loader, "birdshot_add_service_token", {V, V}, V, AddServiceTokenFn);
 	Register(loader, "birdshot_commit_config", {}, V, CommitConfigFn);

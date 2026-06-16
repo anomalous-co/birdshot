@@ -41,6 +41,18 @@ struct Grant {
 	bool write;
 };
 
+// A finer-grained constraint attached to a role, scoped to one table. Layered on
+// top of the coarse table grant above: a column allow-list and a UTC time window.
+// (Row caps are NOT enforced by birdshot — a boolean authz hook can't truncate a
+// result, and the LIMIT is stripped before the gateway ever sees a direct ref.)
+// The sentinels mean "no restriction" so an entry can carry either dimension alone.
+struct GrantConstraint {
+	std::string table_ref;            // lowercased "schema.table"
+	std::vector<std::string> columns; // lowercased allow-list; empty == unrestricted
+	int32_t window_start_min = -1;    // minutes-of-day UTC; -1 == no window
+	int32_t window_end_min = -1;      // minutes-of-day UTC; -1 == no window
+};
+
 // Verified caller identity, cached per quack session id at authentication time.
 struct Identity {
 	std::string user_id;
@@ -70,6 +82,12 @@ struct PolicySnapshot {
 	std::vector<JwkKey> jwks;
 	std::unordered_map<std::string, std::vector<std::string>> user_roles; // user_id -> role ids
 	std::unordered_map<std::string, std::vector<Grant>> role_grants;      // role id -> grants
+	std::unordered_map<std::string, std::vector<GrantConstraint>> role_constraints; // role id -> constraints
+	// The catalog alias the lake is ATTACHed under (e.g. "lake"). The authz hook
+	// runs on a fresh transient connection where the gateway's `USE <alias>` does
+	// not carry over, so column positional resolution must name the catalog
+	// explicitly. Empty == unset (fall back to the ref's own catalog/default path).
+	std::string lake_catalog;
 	// Static, long-lived credentials for machine/peer auth (e.g. the quack
 	// federation token), checked before JWT verification. token -> user_id.
 	std::unordered_map<std::string, std::string> service_tokens;
@@ -88,6 +106,10 @@ public:
 	void SetSecret(const std::string &secret);
 	void AddJwk(const std::string &kid, const std::string &n_b64url, const std::string &e_b64url);
 	void AddRoleGrant(const std::string &role, const std::string &table_ref, bool write);
+	void AddGrantConstraint(const std::string &role, const std::string &table_ref,
+	                        const std::vector<std::string> &columns,
+	                        int32_t window_start_min, int32_t window_end_min);
+	void SetLakeCatalog(const std::string &name);
 	void AddUserRole(const std::string &user_id, const std::string &role);
 	void AddServiceToken(const std::string &token, const std::string &user_id);
 	bool LookupServiceToken(const std::string &token, std::string &user_id);
@@ -107,6 +129,10 @@ public:
 	// Returns a copy of the caller's merged grants (cheap: per-user grant sets
 	// are small). Empty vector => no grants => default deny.
 	std::vector<Grant> GrantsForUser(const std::string &user_id);
+	// Merged constraints across the user's roles (same union semantics as
+	// GrantsForUser; no dedup). Empty => no constraints.
+	std::vector<GrantConstraint> ConstraintsForUser(const std::string &user_id);
+	std::string LakeCatalog();
 	AuthMode Mode();
 	std::string Issuer();
 	std::string Audience();
