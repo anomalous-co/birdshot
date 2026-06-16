@@ -62,6 +62,18 @@
 
 namespace birdshot {
 
+// Extract the schema component from a lowercased table ref "[catalog.]schema.table"
+// — the second-to-last dot-delimited component. "" if there is no schema part.
+inline std::string SchemaOfRef(const std::string &ref) {
+	size_t last = ref.rfind('.');
+	if (last == std::string::npos || last == 0)
+		return "";
+	size_t prev = ref.rfind('.', last - 1);
+	if (prev == std::string::npos)
+		return ref.substr(0, last);
+	return ref.substr(prev + 1, last - prev - 1);
+}
+
 // A base table actually referenced by the bound plan, with the real columns
 // read from it. `read_cols` holds lowercased catalog column NAMES (struct fields
 // and positionals already resolved to their base column). For a write target the
@@ -335,7 +347,8 @@ inline bool BindAnalyzeStatement(duckdb::ClientContext &ctx, duckdb::SQLStatemen
 // connection where `USE lake` did not carry) resolves against the lake. The hook
 // runs on the SHARED connection, so the search path is saved and RESTORED.
 inline BoundAclAnalysis BindAnalyze(duckdb::ClientContext &ctx, const std::string &sql,
-                                    const std::string &lake_catalog) {
+                                    const std::string &lake_catalog,
+                                    const std::vector<std::string> &lake_schemas) {
 	using namespace duckdb;
 	BoundAclAnalysis a;
 
@@ -362,7 +375,16 @@ inline BoundAclAnalysis BindAnalyze(duckdb::ClientContext &ctx, const std::strin
 			saved_path = csp->GetSetPaths();
 			path_saved = true;
 			duckdb::vector<CatalogSearchEntry> np;
+			// Every schema the agent can touch (from its grants) PLUS main, all under the
+			// lake catalog — quack drops the schema on direct-ref push-down, so a table in
+			// `sales` arrives as a bare `orders` and only binds if `sales` is in scope.
+			std::unordered_set<std::string> seen;
 			np.emplace_back(lake_catalog, "main");
+			seen.insert("main");
+			for (const auto &sch : lake_schemas) {
+				if (!sch.empty() && seen.insert(sch).second)
+					np.emplace_back(lake_catalog, sch);
+			}
 			csp->Set(np, CatalogSetPathType::SET_SCHEMAS);
 		} catch (const std::exception &) {
 			// If we can't set the search path, proceed without it; a bare unqualified

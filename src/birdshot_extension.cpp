@@ -622,7 +622,25 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 			} else if (!state.HasContext()) {
 				reason = "no_context"; // bind-walk needs the live context; fail closed
 			} else {
-				BoundAclAnalysis a = BindAnalyze(state.GetContext(), query, st.LakeCatalog());
+				// Bind with the agent's GRANTED schemas in scope. quack pushes direct refs
+				// down as BARE table names (schema dropped): `remote.sales.orders` arrives as
+				// `SELECT #1,#2,... FROM orders`. With only (lake,main) in the search path a
+				// table living in `sales` can't bind -> bind_error -> fail-closed deny of a
+				// legitimate granted read. The grants name every schema the agent may touch.
+				auto grants = st.GrantsForUser(id.user_id);
+				std::vector<std::string> lake_schemas;
+				for (const auto &g : grants) {
+					std::string sch = SchemaOfRef(g.table_ref);
+					bool seen = sch.empty();
+					for (const auto &s : lake_schemas)
+						if (s == sch) {
+							seen = true;
+							break;
+						}
+					if (!seen)
+						lake_schemas.push_back(sch);
+				}
+				BoundAclAnalysis a = BindAnalyze(state.GetContext(), query, st.LakeCatalog(), lake_schemas);
 				if (a.cls == AclClass::ALLOW_ALL) {
 					allow = true;
 					reason = "ok";
@@ -637,8 +655,8 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 					// parse-walk's role is strictly the forbidden-CLASS pre-filter above.
 					reason = a.reason;
 				} else {
-					// CHECK: every touched table must be covered by a grant.
-					auto grants = st.GrantsForUser(id.user_id);
+					// CHECK: every touched table must be covered by a grant. (`grants`
+					// fetched above for the bind search-path schemas; reuse it.)
 					bool all_ok = true;
 					for (const auto &use : a.tables) {
 						if (!BoundUseSatisfied(use, grants)) {
