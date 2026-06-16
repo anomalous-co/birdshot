@@ -367,14 +367,26 @@ inline void WalkRef(const duckdb::TableRef &ref, WalkCtx &ctx) {
 		break;
 	}
 	case TableReferenceType::SHOW_REF: {
-		// SHOW / DESCRIBE / SUMMARIZE — introspection (same posture as the allowed
-		// duckdb_*/pragma_* table functions the ATTACH handshake needs). The
-		// `table_name` form is pure metadata; if it wraps a SELECT (e.g.
-		// `SUMMARIZE SELECT * FROM t`, which executes the inner query), descend so
-		// that inner query is still table/column-gated.
+		// SHOW / DESCRIBE / SUMMARIZE. DuckDB transforms a DESCRIBE/SUMMARIZE of a
+		// SPECIFIC relation into a ShowRef carrying a `query` = `SELECT * FROM
+		// <rel>` (table_name stays empty); the bare introspection forms (`SHOW
+		// tables`, `SHOW ALL TABLES`, `SHOW TABLES FROM db`) carry only
+		// table_name/schema_name with NO query.
+		//
+		// A DESCRIBE/SUMMARIZE of a relation leaks that relation's existence +
+		// column names but DESCRIBE produces NO scan, so bind-and-walk (which only
+		// sees LogicalGet scans) is blind to it -> it would fall through to
+		// ALLOW_ALL. Fail closed at the parse layer whenever a `query` is present
+		// (it names a specific relation) — this denies DESCRIBE/SUMMARIZE of any
+		// table, including a granted-but-column-constrained one whose constrained
+		// column names DESCRIBE would otherwise expose. The bare table_name-only
+		// SHOW forms (the ATTACH handshake needs them) stay allowed.
 		auto &sr = ref.Cast<ShowRef>();
-		if (sr.query)
-			WalkNode(*sr.query, ctx);
+		if (sr.query) {
+			ctx.forbidden = true;
+			ctx.reason = "forbidden_describe";
+			WalkNode(*sr.query, ctx); // defense in depth: still gate the inner query
+		}
 		break;
 	}
 	case TableReferenceType::EMPTY_FROM:

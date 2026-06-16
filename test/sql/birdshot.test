@@ -48,6 +48,29 @@ SELECT birdshot_status() LIKE 'mode=dev%';
 ----
 true
 
+# ---- catalog fixtures -------------------------------------------------------
+#
+# Bind-and-walk binds the query against the real catalog, so the tables an
+# authorization test references must EXIST (a query over a non-existent table
+# can't bind and is denied, fail-closed — which is correct). These mirror the
+# lake tables that exist in production. `main.todos` is the granted table;
+# `secrets` exists but is NOT granted, so its deny tests the real
+# exists-but-ungranted property (not an incidental bind failure).
+
+statement ok
+CREATE TABLE main.todos(id INT, title VARCHAR);
+
+statement ok
+CREATE TABLE secrets(id INT, title VARCHAR);
+
+# `whoami()` is a quack-provided node-identity table macro that exists in
+# production (the authz hook runs on a quack connection). The bare test DB does not
+# load quack, so bind-and-walk could not bind it; stub it to mirror prod. The
+# pre-filter still allowlists it by NAME (IsSafeTableFunc), so this stays a real S7
+# test — a non-allowlisted table function is denied at the pre-filter regardless.
+statement ok
+CREATE MACRO whoami() AS TABLE (SELECT 'node' AS node_id);
+
 # ---- authentication ---------------------------------------------------------
 
 # Static service token authenticates as user 'alice'.
@@ -88,9 +111,10 @@ SELECT birdshot_authorize('sess1', 'SELECT * FROM secrets');
 ----
 false
 
-# Write to a read-only granted table -> deny.
+# Write to a read-only granted table -> deny. (Well-formed arity so the denial is
+# the write-grant check, not an incidental bind column-count error.)
 query I
-SELECT birdshot_authorize('sess1', 'INSERT INTO main.todos VALUES (1)');
+SELECT birdshot_authorize('sess1', 'INSERT INTO main.todos VALUES (1, ''x'')');
 ----
 false
 
@@ -616,19 +640,36 @@ SELECT birdshot_authorize('bsess', 'WITH RECURSIVE r AS (SELECT c1 FROM main.t2 
 ----
 true
 
-# S8: multi-table UNQUALIFIED columns resolve via the catalog instead of a blanket
-# ambiguity-deny. An unqualified name in C(main.t) but not in {c1,c2} -> deny;
-# otherwise the multi-table query "just works".
+# S8 (bind-and-walk): multi-table columns are resolved to their REAL table by the
+# binder (each BoundColumnRef carries its own table_index), so a column allowed on
+# the constrained table passes and a forbidden one is caught -- no qualifier
+# heuristics. Note: a GENUINELY AMBIGUOUS unqualified column across a join (a bare
+# name present in BOTH tables, e.g. `SELECT c1 FROM main.t JOIN main.t2`) is INVALID
+# SQL -- plain DuckDB throws "Ambiguous reference to column name c1", and so does the
+# agent's own DuckDB in production -- so bind-and-walk fails closed (DENY) on it.
+# That is correct, so the ALLOW cases below use the well-formed disambiguated forms
+# (qualified / USING / single-table-scoped) an agent must actually write.
 
-# ALLOW: unqualified allowed column across a join.
+# ALLOW: an allowed column scoped to the constrained table across a join (the
+# `t.c1`/USING forms below also cover the unqualified-resolution intent).
 query I
-SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+SELECT birdshot_authorize('bsess', 'SELECT main.t.c1 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
 ----
 true
 
-# DENY: unqualified forbidden column (c3 in C(main.t), not in allow-list).
+# DENY: a forbidden column on the constrained table across a join (c3 in C(main.t),
+# not in {c1,c2}).
 query I
-SELECT birdshot_authorize('bsess', 'SELECT c3 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+SELECT birdshot_authorize('bsess', 'SELECT main.t.c3 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
+----
+false
+
+# Control: an unqualified column present in BOTH joined tables is AMBIGUOUS -- the
+# binder throws "Ambiguous reference to column name", so bind-and-walk fails closed
+# -> DENY. (Plain DuckDB rejects this query too; an agent must qualify it. This is
+# at least as strict as the old parse-walk heuristic, which guessed a table.)
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
 ----
 false
 
@@ -662,9 +703,10 @@ SELECT birdshot_authorize('bsess', 'SELECT t2.c3 FROM main.t t JOIN main.t2 t2 O
 true
 
 # A computed SELECT alias referenced in ORDER BY resolves to no catalog column
-# -> not charged -> allow.
+# -> not charged -> allow. (Source column qualified to disambiguate across the join;
+# the alias `x` itself is not a catalog column.)
 query I
-SELECT birdshot_authorize('bsess', 'SELECT c1 + 1 AS x FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1 ORDER BY x');
+SELECT birdshot_authorize('bsess', 'SELECT main.t.c1 + 1 AS x FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1 ORDER BY x');
 ----
 true
 
@@ -681,16 +723,256 @@ SELECT birdshot_authorize('bsess', 'SELECT main.t.c1 FROM main.t JOIN main.t2 ON
 ----
 true
 
-# S8 completeness: a GENERATED column (c5) must be in C(main.t) so an unqualified
-# multi-table ref to it is caught (c5 not in {c1,c2}) -> deny. If this ALLOWs,
-# GetColumnNames() omits generated columns = an under-charge bypass.
+# Generated columns -> INFORMATION-FLOW semantics (bind-and-walk's natural model,
+# user decision). The binder replaces a generated column with its generation
+# expression, so bind-and-walk sees the SOURCE columns it reads, not the generated
+# name. `c5` (= c1 + 1) derives ONLY from the allowed column c1, so reading c5
+# reads only allowed data -> ALLOW. (`c5` is unambiguous: it exists only on main.t.)
+# This is sound: a generated column is allowed iff all its source columns are
+# allowed; no forbidden data can leak through it. The forbidden-source control
+# (a generated column derived from c3) is in the bind-and-walk regression section.
 query I
 SELECT birdshot_authorize('bsess', 'SELECT c5 FROM main.t JOIN main.t2 ON main.t.c1 = main.t2.c1');
 ----
-false
+true
 
 # S7: whoami() is allow-listed as quack node-identity introspection -> allow.
 query I
 SELECT birdshot_authorize('bsess', 'SELECT * FROM whoami()');
 ----
 true
+
+# ============================================================================
+# bind-and-walk regression suite
+#
+# These pin the bind-and-walk extraction (which supersedes the parse-walk's
+# table/column extraction). All run on the `bsess` session (user bob, role
+# colrole): main.t read+write, columns restricted to {c1,c2}; main.t2 read+write,
+# unconstrained. lake_catalog = 'memory'.
+# ============================================================================
+
+# ---- regression-suite fixtures + config -------------------------------------
+# birdshot_commit_config() REPLACES the live snapshot with staging (it does not
+# merge), exactly like the gateway's applySnapshot. So this section creates ALL
+# its tables, then RE-STAGES the complete colrole config (the original grants +
+# the regression-table grants/constraints) and commits ONCE. The `bsess` session
+# (authenticated earlier) survives — sessions are kept separately from the
+# swappable policy snapshot.
+
+statement ok
+CREATE TABLE main.st(c1 INT, c2 INT, c3 STRUCT(f INT, g INT), c4 STRUCT(mid STRUCT(deeper INT)));
+
+statement ok
+CREATE TABLE main.gt(c1 INT, c2 INT, c3 INT, g_ok INT GENERATED ALWAYS AS (c1 + 1), g_bad INT GENERATED ALWAYS AS (c3 + 1));
+
+statement ok
+CREATE TABLE main.ungranted(c1 INT);
+
+# Re-stage the FULL colrole policy (original + regression tables) and commit once.
+statement ok
+SELECT birdshot_set_auth('', '', 'dev');
+
+statement ok
+SELECT birdshot_set_lake_catalog('memory');
+
+statement ok
+SELECT birdshot_add_role_grant('colrole', 'main.t', 'read');
+
+statement ok
+SELECT birdshot_add_role_grant('colrole', 'main.t', 'write');
+
+statement ok
+SELECT birdshot_add_role_grant('colrole', 'main.t2', 'read');
+
+statement ok
+SELECT birdshot_add_role_grant('colrole', 'main.t2', 'write');
+
+statement ok
+SELECT birdshot_add_role_grant('colrole', 'main.st', 'read');
+
+statement ok
+SELECT birdshot_add_role_grant('colrole', 'main.gt', 'read');
+
+statement ok
+SELECT birdshot_add_grant_constraint('colrole', 'main.t', 'c1,c2', '', '');
+
+statement ok
+SELECT birdshot_add_grant_constraint('colrole', 'main.st', 'c1', '', '');
+
+statement ok
+SELECT birdshot_add_grant_constraint('colrole', 'main.gt', 'c1,c2', '', '');
+
+statement ok
+SELECT birdshot_add_user_role('bob', 'colrole');
+
+statement ok
+SELECT birdshot_commit_config();
+
+# ---- BS-STRUCT-1: dotted struct/nested-field access via bind-walk -----------
+# The binder wraps a struct field access in struct_extract over a BoundColumnRef
+# to the BASE column, so the field name is never a column ref and the base column
+# is charged exactly. main.st is constrained to {c1}: a forbidden base column (c3)
+# is caught; the allowed c1 passes; field idents (`f`,`g`,`deeper`) never leak.
+
+# DENY: unparenthesized dotted access to a forbidden struct base column c3.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c3.f FROM main.st');
+----
+false
+
+# DENY: qualified dotted access (alias) to forbidden c3.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT s.c3.f FROM main.st s');
+----
+false
+
+# DENY: deeply-nested forbidden struct base (c4 not in {c1}).
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c4.mid.deeper FROM main.st');
+----
+false
+
+# DENY: forbidden struct base read in WHERE.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.st WHERE c3.g > 0');
+----
+false
+
+# ALLOW: allowed base column; whole struct never touched.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.st');
+----
+true
+
+# ---- generated columns: information-flow model ------------------------------
+# A generated column is replaced by its generation expr at bind, so bind-walk
+# charges its SOURCE columns. Allowed-source -> allow; forbidden-source -> deny.
+# (main.gt is created + granted + constrained to {c1,c2} in the fixtures above.)
+
+# ALLOW: g_ok = c1 + 1 reads only the allowed column c1.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT g_ok FROM main.gt');
+----
+true
+
+# DENY: g_bad = c3 + 1 reads the forbidden column c3 (info-flow catch).
+query I
+SELECT birdshot_authorize('bsess', 'SELECT g_bad FROM main.gt');
+----
+false
+
+# DENY control: direct forbidden c3.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c3 FROM main.gt');
+----
+false
+
+# ---- WRITES / DDL: target table charged as a write -------------------------
+# INSERT/UPDATE/DELETE bind to LogicalInsert/Update/Delete with the target table;
+# CTAS to LogicalCreateTable. Each is charged as a write TableUse.
+
+# INSERT into a write-granted table (well-formed arity) -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'INSERT INTO main.t2 VALUES (1, 2, 3, 4)');
+----
+true
+
+# INSERT into a table with NO write grant (main.st is read-only) -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'INSERT INTO main.st VALUES (1, 2, NULL, NULL)');
+----
+false
+
+# UPDATE a write-granted table -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'UPDATE main.t2 SET c1 = 1 WHERE c2 = 2');
+----
+true
+
+# DELETE on a write-granted table -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'DELETE FROM main.t2 WHERE c1 = 1');
+----
+true
+
+# DELETE on a table with no write grant (main.st) -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'DELETE FROM main.st WHERE c1 = 1');
+----
+false
+
+# CTAS (CREATE TABLE ... AS) is a CREATE/DDL statement class -> denied by the
+# parse-walk PRE-FILTER (Layer 1) before bind-walk runs, same as any CREATE. DDL
+# is never allowed on the agent path. (bind-walk's LogicalCreateTable handler is
+# defensive: it would charge the new table as a write target if a future pre-filter
+# ever admitted CTAS, but today CTAS never reaches Layer 2.)
+query I
+SELECT birdshot_authorize('bsess', 'CREATE TABLE main.t2 AS SELECT c1 FROM main.t2');
+----
+false
+
+# UPDATE writing a forbidden column on a column-constrained table -> deny
+# (column allow-lists are not action-scoped; c3 not in {c1,c2}).
+query I
+SELECT birdshot_authorize('bsess', 'UPDATE main.t SET c3 = 1 WHERE c1 = 0');
+----
+false
+
+# ---- multi-statement batch: every statement is bound + walked ---------------
+# A forbidden/ungranted read hidden after a benign statement denies the batch.
+# (main.ungranted is created in the fixtures above; it has no grant.)
+
+# A batch whose 2nd statement reads an ungranted table -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t2; SELECT c1 FROM main.ungranted');
+----
+false
+
+# A batch of two granted reads -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t2; SELECT c1 FROM main.t');
+----
+true
+
+# A batch whose 2nd statement reads a forbidden column on a constrained table -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1 FROM main.t; SELECT c3 FROM main.t');
+----
+false
+
+# ---- Q3: bare (unqualified) table resolves against the lake catalog ---------
+# Form-A push-down sends `FROM <bare>` on a connection where USE lake did not
+# carry. lake_catalog='memory' (the default here), so a bare ref resolves and the
+# column constraint still applies.
+
+# Bare table, allowed columns -> allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c1, c2 FROM t');
+----
+true
+
+# Bare table, forbidden column -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT c3 FROM t');
+----
+false
+
+# Bare positional refs (#N, form-A) resolve to catalog ordinals -> c1,c2 allow.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT #1, #2 FROM t');
+----
+true
+
+# Bare positional ref to a forbidden ordinal (#3 = c3) -> deny.
+query I
+SELECT birdshot_authorize('bsess', 'SELECT #3 FROM t');
+----
+false
+
+# ---- read_csv is blocked at the pre-filter (file/dynamic reader denylist) ----
+# (enable_external_access=false is a Phase-3 gateway boot setting; the parse-walk
+# pre-filter denies read_csv regardless, so this holds in-harness too.)
+query I
+SELECT birdshot_authorize('bsess', 'SELECT * FROM read_csv(''/etc/passwd'')');
+----
+false

@@ -3,7 +3,8 @@
 #include "birdshot_extension.hpp"
 #include "birdshot_state.hpp"
 #include "birdshot_jwt.hpp"
-#include "birdshot_acl.hpp"
+#include "birdshot_acl.hpp"          // parse-walk fallback (kept compiled in-tree)
+#include "birdshot_bind_analyze.hpp" // bind-and-walk primary path
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -512,6 +513,66 @@ static bool EnforceConstraints(const AclAnalysis &a, const std::vector<GrantCons
 	return true;
 }
 
+// ---- bind-and-walk enforcement (primary path) ------------------------------
+
+// Grant check for a bound table use (mirrors UseSatisfied, which takes the
+// parse-walk's TableUse; BoundTableUse carries the same ref/write).
+static bool BoundUseSatisfied(const BoundTableUse &use, const std::vector<Grant> &grants) {
+	for (const auto &g : grants) {
+		if (!RefMatch(g.table_ref, use.ref))
+			continue;
+		if (use.write) {
+			if (g.write)
+				return true;
+		} else {
+			return true; // any matching grant (read or write) covers a read
+		}
+	}
+	return false;
+}
+
+// Column allow-list + time-window enforcement over the bound analysis. Every
+// column the binder resolved is a REAL catalog column attributed to its REAL
+// table (by table_index), so there is no single/multi-table split, no positional
+// resolution, no star handling — just set membership. Fails closed on any
+// non-allowed column. Returns true iff every constraint is satisfied.
+static bool EnforceBoundConstraints(const BoundAclAnalysis &a, const std::vector<GrantConstraint> &constraints,
+                                    std::string &reason) {
+	if (constraints.empty())
+		return true;
+	int32_t now_min = -1; // computed lazily, once
+	for (const auto &use : a.tables) {
+		for (const auto &c : constraints) {
+			if (!RefMatch(c.table_ref, use.ref))
+				continue;
+
+			// time window (clock-based; independent of query form).
+			if (c.window_start_min >= 0) {
+				if (now_min < 0)
+					now_min = NowMinutesUtc();
+				if (!WithinWindow(now_min, c.window_start_min, c.window_end_min)) {
+					reason = std::string("window:") + use.ref;
+					return false;
+				}
+			}
+
+			// column allow-list: every resolved read column must be allowed.
+			if (c.columns.empty())
+				continue; // unrestricted
+			std::unordered_map<std::string, bool> allowed;
+			for (const auto &col : c.columns)
+				allowed[col] = true;
+			for (const auto &col : use.read_cols) {
+				if (allowed.find(col) == allowed.end()) {
+					reason = std::string("col:") + use.ref;
+					return false;
+				}
+			}
+		}
+	}
+	return true;
+}
+
 // birdshot_authorize(sid, query) -> BOOLEAN
 static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 	args.data[0].Flatten(args.size());
@@ -541,35 +602,62 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 			reason = "revoked";
 		} else {
 			e.user_id = id.user_id;
-			AclAnalysis a = Analyze(query);
-			if (a.cls == AclClass::ALLOW_ALL) {
-				allow = true;
-				reason = "ok";
-			} else if (a.cls == AclClass::FORBIDDEN) {
-				reason = a.reason;
-			} else if (a.cls == AclClass::PARSE_ERR) {
-				reason = a.reason; // fail closed
+			// Two-layer analysis:
+			//   (1) PARSE-WALK PRE-FILTER (forbidden-class gate): the parse-walk's
+			//       statement-type allowlist + dangerous-function / autoload-cast /
+			//       non-introspection-table-function denylist. Bind-and-walk extracts
+			//       tables/columns but does NOT subsume class gating — a forbidden
+			//       statement (ATTACH/PRAGMA/DROP), a birdshot_* / read_* call, or a
+			//       non-introspection table function binds to NO base-table GET and
+			//       would otherwise fall through to ALLOW_ALL. So the parse-walk's
+			//       forbidden verdict is a mandatory pre-filter; we consume ONLY its
+			//       class (its table/column extraction is superseded by bind-walk).
+			//   (2) BIND-AND-WALK EXTRACTION: bind against the lake catalog (no
+			//       optimizer) and walk the bound plan for fully-resolved
+			//       tables/columns (structs/stars/positionals/CTEs/multi-table all
+			//       resolved by the binder).
+			AclAnalysis pre = Analyze(query);
+			if (pre.cls == AclClass::FORBIDDEN || pre.cls == AclClass::PARSE_ERR) {
+				reason = pre.reason; // fail closed on forbidden class / unparseable
+			} else if (!state.HasContext()) {
+				reason = "no_context"; // bind-walk needs the live context; fail closed
 			} else {
-				// CHECK: every touched table must be covered by a grant.
-				auto grants = st.GrantsForUser(id.user_id);
-				bool all_ok = true;
-				for (const auto &use : a.tables) {
-					if (!UseSatisfied(use, grants)) {
-						all_ok = false;
-						reason = std::string("acl:") + (use.write ? "w:" : "r:") + use.ref;
-						break;
-					}
-				}
-				// Then the finer-grained constraints (column allow-lists + time
-				// windows) layered on top of the table grants.
-				if (all_ok) {
-					auto constraints = st.ConstraintsForUser(id.user_id);
-					if (!EnforceConstraints(a, constraints, st.LakeCatalog(), state, reason))
-						all_ok = false;
-				}
-				allow = all_ok;
-				if (allow)
+				BoundAclAnalysis a = BindAnalyze(state.GetContext(), query, st.LakeCatalog());
+				if (a.cls == AclClass::ALLOW_ALL) {
+					allow = true;
 					reason = "ok";
+				} else if (a.cls == AclClass::FORBIDDEN || a.cls == AclClass::PARSE_ERR) {
+					// Bind-and-walk could not bind the statement (un-bindable SQL, an
+					// unresolvable column, or a forbidden bound operator) -> FAIL CLOSED
+					// (deny). We deliberately do NOT fall back to the parse-walk's
+					// table/column extraction here: that extraction is exactly what
+					// bind-and-walk supersedes (its struct/star/positional/S8
+					// approximations are the historical bypass surface), so trusting it
+					// on the bind-failure path would reintroduce that surface. The
+					// parse-walk's role is strictly the forbidden-CLASS pre-filter above.
+					reason = a.reason;
+				} else {
+					// CHECK: every touched table must be covered by a grant.
+					auto grants = st.GrantsForUser(id.user_id);
+					bool all_ok = true;
+					for (const auto &use : a.tables) {
+						if (!BoundUseSatisfied(use, grants)) {
+							all_ok = false;
+							reason = std::string("acl:") + (use.write ? "w:" : "r:") + use.ref;
+							break;
+						}
+					}
+					// Then the finer-grained constraints (column allow-lists + time
+					// windows) layered on top of the table grants.
+					if (all_ok) {
+						auto constraints = st.ConstraintsForUser(id.user_id);
+						if (!EnforceBoundConstraints(a, constraints, reason))
+							all_ok = false;
+					}
+					allow = all_ok;
+					if (allow)
+						reason = "ok";
+				}
 			}
 		}
 		e.user_id = id.user_id;
