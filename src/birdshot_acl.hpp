@@ -172,18 +172,11 @@ inline bool IsSafeTableFunc(const std::string &lname) {
 	return lname.rfind("duckdb_", 0) == 0 || lname.rfind("pragma_", 0) == 0 || lname == "whoami";
 }
 
-// A CAST to an extension/unknown type (json/geometry/inet/...) pulls that
-// extension in at bind time — an autoload vector birdshot's statement deny can't
-// see. At PARSE time such a type is an unresolved USER type (core types have
-// concrete ids), so deny casts to USER types. A federation peer doing analytics
-// over todos/PII never needs them.
-inline bool IsAutoloadCastType(const duckdb::LogicalType &t) {
-	// An unloaded extension type (e.g. JSON) parses as UNBOUND and is resolved at
-	// bind time — which is when autoload fires. Core types have concrete ids.
-	auto id = t.id();
-	return id == duckdb::LogicalTypeId::UNBOUND || id == duckdb::LogicalTypeId::UNKNOWN;
-}
-
+// CAST autoload protection lives at the BIND layer, not here: at PARSE time EVERY
+// cast target (even core INTEGER/VARCHAR) is an UNKNOWN-id named placeholder, so a
+// parse-time "unknown id => extension type" heuristic blocks ALL casts. Bind-and-walk
+// binds the statement instead — a cast to a first-party extension type autoloads
+// (trusted) and binds; a genuinely unknown type fails to bind => fail-closed deny.
 // Build a ColUse (small helper to keep collection sites uniform).
 inline ColUse MakeCol(const std::string &qualifier, const std::string &name) {
 	ColUse c;
@@ -212,12 +205,6 @@ inline void WalkExpr(const duckdb::ParsedExpression &expr, WalkCtx &ctx) {
 		if (IsDangerousScalarFunc(LowerCopy(we.function_name))) {
 			ctx.forbidden = true;
 			ctx.reason = "forbidden_winfunc:" + LowerCopy(we.function_name);
-		}
-	} else if (cls == ExpressionClass::CAST) {
-		auto &ce = expr.Cast<CastExpression>();
-		if (IsAutoloadCastType(ce.cast_type)) {
-			ctx.forbidden = true;
-			ctx.reason = "forbidden_cast:" + LowerCopy(ce.cast_type.ToString());
 		}
 	} else if (cls == ExpressionClass::SUBQUERY) {
 		auto &sub = expr.Cast<SubqueryExpression>();
