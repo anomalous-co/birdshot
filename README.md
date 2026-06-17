@@ -58,17 +58,49 @@ C++17 compiler, and OpenSSL (vcpkg, or `OPENSSL_ROOT_DIR` for Homebrew OpenSSL).
 Run the extension's own tests:
 
 ```bash
-make test
+make test       # in-process: calls birdshot_authorize() directly (sqllogictest)
+make test-e2e   # end-to-end: real quack client ↔ server, birdshot as the hooks
 ```
+
+`make test` proves the *decision logic* — it calls `birdshot_authorize(sid, query)`
+in-process and checks the boolean. `make test-e2e`
+([`test/e2e/birdshot.e2e.ts`](test/e2e/birdshot.e2e.ts)) proves the decision is
+actually *enforced on the wire*: it stands up a real quack server with birdshot
+wired in as `quack_authentication_function` / `quack_authorization_function`
+(exactly as `packages/db/src/birdshot.ts` does), connects real quack clients, and
+replays every authorize assertion from `test/sql/birdshot.test` end-to-end. A deny
+passes only if birdshot *logged* the deny (attribution) **and** the client was
+actually blocked (enforcement) — so a "denied but rows came back" data leak fails
+the test. (quack isn't compiled into the C++ unittest binary, so the e2e path runs
+on the monorepo's Node runtime, not under `make test`; build the extension first.)
+
+Two client paths are exercised:
+
+- **Form B — `quack_query(uri, '<verbatim SQL>')`**: the whole statement runs
+  server-side, so birdshot sees the exact query string. This carries the full
+  matrix — joins, subquery-smuggle, CTEs, forbidden statements, file readers,
+  casts (99 of the 108 `.test` assertions; the rest are an unknown-session check,
+  two stateful-revocation steps, and `#N` literals covered by Form A).
+- **Form A — `ATTACH 'quack:…'; SELECT cols FROM lake.t`**: the realistic agent
+  path; quack pushes column projections down as positional `#N`. **Product
+  limitation surfaced by the harness:** on this path quack cannot carry a `JOIN`
+  or *any* cross-table / correlated subquery — it throws `Multiple streaming
+  scans` *before birdshot runs*. So the ordinary ATTACH+scan path is
+  single-table-flat only; richer queries must go through `quack_query` (Form B).
 
 ## Status
 
 - **Compiles** against DuckDB v1.5.3 (`./setup-build.sh`, OpenSSL via brew).
-- **`make test` passes** — 36 assertions: configure → authenticate (service token
+- **`make test` passes** — 159 assertions: configure → authenticate (service token
   + dev JWT + reject) → authorize (per-table ACL, write-vs-read, forbidden
   statements, subquery-smuggle, batch-smuggle, birdshot-mutator calls,
   file/dynamic readers, EXPLAIN ANALYZE, **PRAGMA, autoload-type casts**) →
   instant revocation → audit drain.
+- **`make test-e2e` passes** — 115 end-to-end checks: 99 `.test` authorize
+  assertions replayed through a real quack client→server (Form B), plus Form-A
+  `#N` push-down, service-token / dev-JWT / bad-token auth, and the instant
+  revocation cycle. Verdicts are taken from birdshot's own audit log AND the
+  client-side block, so a denial that still leaks rows fails.
 - **Live two-instance federation verified** — both instances peer each other
   through birdshot's hooks (`peer_connected=true`, cross-instance reads). The
   quack ATTACH handshake (introspection) passes the stricter authorize; only real

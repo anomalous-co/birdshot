@@ -1,6 +1,11 @@
 # name: test/sql/birdshot.test
 # description: birdshot auth/authz hooks, ACL, revocation, audit (dev mode)
 # group: [sql]
+#
+# This suite calls birdshot_authorize() IN-PROCESS (decision logic). Its
+# end-to-end companion, test/e2e/birdshot.e2e.ts (`make test-e2e`), replays every
+# authorize assertion below through a real quack client↔server with birdshot wired
+# in as the auth/authz hooks, proving each decision is enforced on the wire.
 
 # Functions don't exist before the extension is loaded.
 statement error

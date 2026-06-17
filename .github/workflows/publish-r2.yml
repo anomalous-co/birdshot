@@ -30,7 +30,7 @@ permissions:
 
 env:
   DUCKDB_VERSION: ${{ inputs.duckdb_version }}
-  R2_BUCKET: duckbase-ext
+  R2_BUCKET: waddling-ext
 
 jobs:
   publish:

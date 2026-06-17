@@ -12,7 +12,7 @@ name: Build & Publish Birdshot Extension
 #   linux_amd64, linux_arm64, osx_amd64, osx_arm64,
 #   windows_amd64, windows_amd64_mingw, wasm_mvp, wasm_eh, wasm_threads
 #
-# R2 layout (served via CDN at https://ext.duckbase.io):
+# R2 layout (served via CDN at https://ext.getwaddling.com):
 #   native: v1.5.3/<platform>/birdshot.duckdb_extension.gz            (gzip)
 #   wasm:   duckdb-wasm/v1.5.3/<platform>/birdshot.duckdb_extension.wasm
 # The duckdb-wasm/ prefix + .wasm suffix is what the DuckDB-Wasm loader expects.
@@ -28,7 +28,7 @@ permissions:
 
 env:
   DUCKDB_VERSION: v1.5.3
-  R2_BUCKET: duckbase-ext
+  R2_BUCKET: waddling-ext
 
 jobs:
   # ── Build all platforms via DuckDB's reusable workflow ───────────────────────
@@ -118,13 +118,13 @@ jobs:
             echo "**Native install:**"
             echo '```sql'
             echo "SET allow_unsigned_extensions = true;"
-            echo "INSTALL birdshot FROM 'https://ext.duckbase.io';"
+            echo "INSTALL birdshot FROM 'https://ext.getwaddling.com';"
             echo "LOAD birdshot;"
             echo '```'
             echo ""
             echo "**DuckDB-Wasm** (autoloads from custom repo):"
             echo '```sql'
-            echo "SET custom_extension_repository = 'https://ext.duckbase.io';"
+            echo "SET custom_extension_repository = 'https://ext.getwaddling.com';"
             echo "LOAD birdshot;"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
