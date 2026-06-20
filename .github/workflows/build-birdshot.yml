@@ -49,12 +49,23 @@ jobs:
       # Builds: linux_amd64, linux_arm64, osx_amd64, osx_arm64,
       #         wasm_mvp, wasm_eh, wasm_threads
       exclude_archs: 'windows_amd64;windows_amd64_mingw'
+      # Run every platform independently: 'disabled' turns OFF fail-fast AND the
+      # "osx/wasm only if linux succeeded" gate. linux_arm64 cold-builds DuckDB from
+      # source on a 16GB native arm64 runner and intermittently OOMs (exit 137); with
+      # fail-fast that one leg cancels osx/wasm and skips publish. Decoupling them lets
+      # every other target (incl. the prod linux_amd64) build and publish regardless.
+      reduced_ci_mode: 'disabled'
 
   # ── Publish every artifact to Cloudflare R2 ──────────────────────────────────
   publish:
     name: Publish to R2
     needs: build
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    # always() so a single failed/flaky build leg (e.g. linux_arm64 OOM) does NOT skip
+    # publish: it downloads whatever artifacts DID upload and ships them. The publish
+    # step still errors if ZERO artifacts are present, so a fully-broken build can't
+    # silently no-op. (Each target overwrites only its own R2 key, so a missing leg
+    # leaves that platform's prior artifact in place rather than deleting it.)
+    if: always() && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-24.04
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
