@@ -71,10 +71,35 @@ void State::AddJwk(const std::string &kid, const std::string &n, const std::stri
 	std::lock_guard<std::mutex> lk(mtx_);
 	staging_.jwks.push_back({kid, n, e});
 }
-void State::AddRoleGrant(const std::string &role, const std::string &table_ref, bool write) {
+void State::AddRoleGrant(const std::string &role, const std::string &resource_ref, const std::string &cap_str) {
+	Capability cap;
+	if (!ParseCapability(cap_str, cap))
+		return; // unknown capability string — fail-closed: drop the grant, don't over-grant
 	std::lock_guard<std::mutex> lk(mtx_);
-	staging_.role_grants[role].push_back({LowerCopy(table_ref), write});
+	// Explicit field assignment (not brace-init): under the forced -std=c++11, Grant's
+	// in-class default initializer (cap = READ) makes it a non-aggregate, so {..} fails.
+	Grant g;
+	g.resource_ref = LowerCopy(resource_ref);
+	g.cap = cap;
+	staging_.role_grants[role].push_back(g);
 }
+void State::AddSourcePolicy(const std::string &role, const std::string &pattern) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	staging_.source_policies[role].push_back({pattern});
+}
+void State::AddDestPolicy(const std::string &role, const std::string &pattern) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	staging_.dest_policies[role].push_back({pattern});
+}
+void State::AddExtPolicy(const std::string &role, const std::string &pattern) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	staging_.ext_policies[role].push_back({pattern});
+}
+void State::AddAttachPolicy(const std::string &role, const std::string &pattern) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	staging_.attach_policies[role].push_back({pattern});
+}
+
 void State::AddGrantConstraint(const std::string &role, const std::string &table_ref,
                                const std::vector<std::string> &columns,
                                int32_t window_start_min, int32_t window_end_min) {
@@ -194,6 +219,41 @@ std::vector<GrantConstraint> State::ConstraintsForUser(const std::string &user_i
 	}
 	return out;
 }
+// Shared logic: collect all ResourcePolicy entries for a user across their roles,
+// reading from the given policy store (passed as a reference to avoid pointer-to-
+// member qualification complexity). Caller holds mtx_ and passes live_.
+static std::vector<ResourcePolicy>
+MergeResourcePoliciesImpl(const PolicySnapshot &snap, const std::string &user_id,
+                          const std::unordered_map<std::string, std::vector<ResourcePolicy>> &store) {
+	std::vector<ResourcePolicy> out;
+	auto it = snap.user_roles.find(user_id);
+	if (it == snap.user_roles.end())
+		return out;
+	for (const auto &role : it->second) {
+		auto pit = store.find(role);
+		if (pit != store.end())
+			out.insert(out.end(), pit->second.begin(), pit->second.end());
+	}
+	return out;
+}
+
+std::vector<ResourcePolicy> State::SourcePoliciesForUser(const std::string &user_id) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return MergeResourcePoliciesImpl(live_, user_id, live_.source_policies);
+}
+std::vector<ResourcePolicy> State::DestPoliciesForUser(const std::string &user_id) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return MergeResourcePoliciesImpl(live_, user_id, live_.dest_policies);
+}
+std::vector<ResourcePolicy> State::ExtPoliciesForUser(const std::string &user_id) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return MergeResourcePoliciesImpl(live_, user_id, live_.ext_policies);
+}
+std::vector<ResourcePolicy> State::AttachPoliciesForUser(const std::string &user_id) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return MergeResourcePoliciesImpl(live_, user_id, live_.attach_policies);
+}
+
 std::string State::LakeCatalog() {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return live_.lake_catalog;
@@ -280,18 +340,15 @@ static bool RefMatch(const std::string &grant_ref, const std::string &use_ref) {
 	return false;
 }
 
-// A table use is satisfied if some grant matches the ref AND covers the action.
-// A 'write' grant also satisfies a 'read' use (write ⊇ read).
+// A table use is satisfied if some grant matches the ref AND its capability covers
+// the use's required capability (via Covers()). WRITE ⊇ READ: a write grant also
+// satisfies a read need. All other capability pairs are distinct.
 static bool UseSatisfied(const TableUse &use, const std::vector<Grant> &grants) {
 	for (const auto &g : grants) {
-		if (!RefMatch(g.table_ref, use.ref))
+		if (!RefMatch(g.resource_ref, use.ref))
 			continue;
-		if (use.write) {
-			if (g.write)
-				return true;
-		} else {
-			return true; // any matching grant (read or write) covers a read
-		}
+		if (Covers(g.cap, use.cap))
+			return true;
 	}
 	return false;
 }
@@ -515,18 +572,14 @@ static bool EnforceConstraints(const AclAnalysis &a, const std::vector<GrantCons
 
 // ---- bind-and-walk enforcement (primary path) ------------------------------
 
-// Grant check for a bound table use (mirrors UseSatisfied, which takes the
-// parse-walk's TableUse; BoundTableUse carries the same ref/write).
+// Grant check for a bound table use. Mirrors UseSatisfied; BoundTableUse carries
+// the same ref and now a Capability rather than bool write.
 static bool BoundUseSatisfied(const BoundTableUse &use, const std::vector<Grant> &grants) {
 	for (const auto &g : grants) {
-		if (!RefMatch(g.table_ref, use.ref))
+		if (!RefMatch(g.resource_ref, use.ref))
 			continue;
-		if (use.write) {
-			if (g.write)
-				return true;
-		} else {
-			return true; // any matching grant (read or write) covers a read
-		}
+		if (Covers(g.cap, use.cap))
+			return true;
 	}
 	return false;
 }
@@ -619,6 +672,75 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 			AclAnalysis pre = Analyze(query);
 			if (pre.cls == AclClass::FORBIDDEN || pre.cls == AclClass::PARSE_ERR) {
 				reason = pre.reason; // fail closed on forbidden class / unparseable
+			} else if (!pre.cap_uses.empty() || !pre.policy_uses.empty()) {
+				// ── PARSE-AUTHORIZED PATH (full-scope capability classes) ───
+				// The batch contains a CREATE/DROP/ALTER/DETACH/COPY/ATTACH/INSTALL/LOAD
+				// statement. These are authorized ENTIRELY here from the parse tree — the
+				// bind-walk is for SELECT/DML only (its unknown-operator floor is default-
+				// ALLOW, and external resources can't bind under enable_external_access=
+				// false). Every catalog target is checked against grants (capability-aware
+				// Covers); every external resource against the role's policy allowlist.
+				auto grants = st.GrantsForUser(id.user_id);
+				bool all_ok = true;
+				// (a) catalog DDL targets (CREATE/DROP/ALTER/DETACH + COPY-FROM write target).
+				for (const auto &use : pre.cap_uses) {
+					if (!UseSatisfied(use, grants)) {
+						all_ok = false;
+						reason = std::string("acl:") + CapabilityName(use.cap) + ":" + use.ref;
+						break;
+					}
+				}
+				// (b) source-table reads pulled in by a CTAS / COPY-TO inner query walk.
+				if (all_ok) {
+					for (const auto &use : pre.tables) {
+						if (!UseSatisfied(use, grants)) {
+							all_ok = false;
+							reason = std::string("acl:") + CapabilityName(use.cap) + ":" + use.ref;
+							break;
+						}
+					}
+				}
+				// (c) external-resource policy uses (default-deny: empty list => deny).
+				if (all_ok) {
+					for (const auto &pu : pre.policy_uses) {
+						bool matched = false;
+						switch (pu.cap) {
+						case Capability::READ_SOURCE:
+							matched = UriPolicyMatch(pu.literal, st.SourcePoliciesForUser(id.user_id));
+							break;
+						case Capability::COPY_TO:
+							matched = UriPolicyMatch(pu.literal, st.DestPoliciesForUser(id.user_id));
+							break;
+						case Capability::INSTALL:
+							matched = ExtNameMatch(pu.literal, st.ExtPoliciesForUser(id.user_id));
+							break;
+						case Capability::ATTACH:
+							matched = AttachTargetMatch(pu.literal, st.AttachPoliciesForUser(id.user_id));
+							break;
+						default:
+							matched = false; // unknown policy capability -> fail closed
+							break;
+						}
+						if (!matched) {
+							all_ok = false;
+							reason = std::string("policy:") + CapabilityName(pu.cap) + ":" + pu.literal;
+							break;
+						}
+					}
+				}
+				// (d) column allow-lists + time windows on any source reads. The bind-walk
+				// is skipped on this path, so use the parse-walk's own column collection
+				// (its original domain) — strictly additional enforcement, never fewer
+				// denials. (Until source policies are emitted in Phase 3 every read_source
+				// is already denied at (c), so this path stays inert in prod today.)
+				if (all_ok) {
+					auto constraints = st.ConstraintsForUser(id.user_id);
+					if (!EnforceConstraints(pre, constraints, st.LakeCatalog(), state, reason))
+						all_ok = false;
+				}
+				allow = all_ok;
+				if (allow)
+					reason = "ok";
 			} else if (!state.HasContext()) {
 				reason = "no_context"; // bind-walk needs the live context; fail closed
 			} else {
@@ -630,7 +752,7 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 				auto grants = st.GrantsForUser(id.user_id);
 				std::vector<std::string> lake_schemas;
 				for (const auto &g : grants) {
-					std::string sch = SchemaOfRef(g.table_ref);
+					std::string sch = SchemaOfRef(g.resource_ref);
 					bool seen = sch.empty();
 					for (const auto &s : lake_schemas)
 						if (s == sch) {
@@ -661,7 +783,7 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 					for (const auto &use : a.tables) {
 						if (!BoundUseSatisfied(use, grants)) {
 							all_ok = false;
-							reason = std::string("acl:") + (use.write ? "w:" : "r:") + use.ref;
+							reason = std::string("acl:") + CapabilityName(use.cap) + ":" + use.ref;
 							break;
 						}
 					}
@@ -779,8 +901,9 @@ static void AddRoleGrantFn(DataChunk &args, ExpressionState &state, Vector &resu
 		args.data[c].Flatten(args.size());
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	for (idx_t i = 0; i < args.size(); i++) {
-		std::string action = ArgStr(args.data[2], i);
-		State::Get().AddRoleGrant(ArgStr(args.data[0], i), ArgStr(args.data[1], i), action == "write");
+		// AddRoleGrant now takes a capability string and is fail-closed on unknown strings.
+		// Legacy callers passing "read" / "write" continue to work unchanged.
+		State::Get().AddRoleGrant(ArgStr(args.data[0], i), ArgStr(args.data[1], i), ArgStr(args.data[2], i));
 		SetStrResult(result, i, "ok");
 	}
 }
@@ -828,6 +951,52 @@ static void AddServiceTokenFn(DataChunk &args, ExpressionState &state, Vector &r
 		SetStrResult(result, i, "ok");
 	}
 }
+// birdshot_add_source_policy(role, pattern) -> 'ok'
+// birdshot_add_dest_policy(role, pattern) -> 'ok'
+// birdshot_add_ext_policy(role, pattern) -> 'ok'
+// birdshot_add_attach_policy(role, pattern) -> 'ok'
+//
+// Non-catalog resource policy setters. `pattern` semantics per matcher in
+// birdshot_acl.hpp: host/subdomain glob for URIs, exact name for extensions.
+// These are additive into the staging snapshot and promoted by birdshot_commit_config().
+// The policies are default-deny: an empty list means no access to the resource class.
+static void AddSourcePolicyFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 2; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		State::Get().AddSourcePolicy(ArgStr(args.data[0], i), ArgStr(args.data[1], i));
+		SetStrResult(result, i, "ok");
+	}
+}
+static void AddDestPolicyFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 2; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		State::Get().AddDestPolicy(ArgStr(args.data[0], i), ArgStr(args.data[1], i));
+		SetStrResult(result, i, "ok");
+	}
+}
+static void AddExtPolicyFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 2; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		State::Get().AddExtPolicy(ArgStr(args.data[0], i), ArgStr(args.data[1], i));
+		SetStrResult(result, i, "ok");
+	}
+}
+static void AddAttachPolicyFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 2; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		State::Get().AddAttachPolicy(ArgStr(args.data[0], i), ArgStr(args.data[1], i));
+		SetStrResult(result, i, "ok");
+	}
+}
+
 static void CommitConfigFn(DataChunk &args, ExpressionState &state, Vector &result) {
 	State::Get().Commit();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -915,6 +1084,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "birdshot_set_lake_catalog", {V}, V, SetLakeCatalogFn);
 	Register(loader, "birdshot_add_user_role", {V, V}, V, AddUserRoleFn);
 	Register(loader, "birdshot_add_service_token", {V, V}, V, AddServiceTokenFn);
+	// Non-catalog resource policy setters (READ_SOURCE / COPY_TO / INSTALL / ATTACH).
+	Register(loader, "birdshot_add_source_policy", {V, V}, V, AddSourcePolicyFn);
+	Register(loader, "birdshot_add_dest_policy",   {V, V}, V, AddDestPolicyFn);
+	Register(loader, "birdshot_add_ext_policy",    {V, V}, V, AddExtPolicyFn);
+	Register(loader, "birdshot_add_attach_policy", {V, V}, V, AddAttachPolicyFn);
 	Register(loader, "birdshot_commit_config", {}, V, CommitConfigFn);
 
 	// Revocation (instant in-memory denylist).

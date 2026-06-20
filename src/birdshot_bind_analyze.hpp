@@ -77,14 +77,14 @@ inline std::string SchemaOfRef(const std::string &ref) {
 // A base table actually referenced by the bound plan, with the real columns
 // read from it. `read_cols` holds lowercased catalog column NAMES (struct fields
 // and positionals already resolved to their base column). For a write target the
-// table is recorded with write=true and (for the column allow-list, which is a
+// table is recorded with cap=WRITE and (for the column allow-list, which is a
 // read concept) no read columns charged.
 struct BoundTableUse {
 	std::string ref; // "[catalog.][schema.]table", lowercased — for RefMatch
 	std::string catalog;
 	std::string schema;
 	std::string table;
-	bool write = false;
+	Capability cap = Capability::READ; // READ for SELECT scans, WRITE for DML targets
 	std::unordered_set<std::string> read_cols; // lowercased real column names
 };
 
@@ -197,7 +197,7 @@ private:
 		u.schema = LowerCopy(tbl.ParentSchema().name);
 		u.table = LowerCopy(tbl.name);
 		u.ref = QualifyRef(u.catalog, u.schema, u.table);
-		u.write = true;
+		u.cap = Capability::WRITE;
 		for (auto &c : write_cols)
 			u.read_cols.insert(c); // written columns are charged like read columns
 		if (!IsSystemRef(u.catalog, u.schema, u.table))
@@ -212,7 +212,9 @@ private:
 		u.schema = LowerCopy(info.schema);
 		u.table = LowerCopy(info.table);
 		u.ref = QualifyRef(u.catalog, u.schema, u.table);
-		u.write = true;
+		// LOGICAL_CREATE_TABLE remains WRITE in this chunk (CREATE→CREATE recategorisation
+		// is deferred to the bind-walk statement-coverage chunk per the implementation plan).
+		u.cap = Capability::WRITE;
 		if (!IsSystemRef(u.catalog, u.schema, u.table))
 			write_tables.push_back(std::move(u));
 	}
@@ -270,7 +272,7 @@ inline BoundTableUse MakeBoundTableUse(duckdb::LogicalGet &get) {
 	u.schema = LowerCopy(tbl->ParentSchema().name);
 	u.table = LowerCopy(tbl->name);
 	u.ref = QualifyRef(u.catalog, u.schema, u.table);
-	u.write = false;
+	u.cap = Capability::READ; // a GET is always a scan (read); DML targets come via AddWriteTable
 	return u;
 }
 
@@ -296,8 +298,11 @@ inline bool BindAnalyzeStatement(duckdb::ClientContext &ctx, duckdb::SQLStatemen
 		auto it = acc.find(tu.ref);
 		if (it == acc.end())
 			it = acc.emplace(tu.ref, tu).first;
-		if (tu.write)
-			it->second.write = true;
+		// Promote to WRITE if either the incoming or the existing entry requires it.
+		// Only READ/WRITE merge here; no general ordering is defined over all capabilities
+		// (CREATE/DROP/ALTER etc. are not yet produced by the bind-walk in this chunk).
+		if (tu.cap == Capability::WRITE)
+			it->second.cap = Capability::WRITE;
 		for (auto &c : tu.read_cols) // merge written/read columns (write-target charges)
 			it->second.read_cols.insert(c);
 		return it->second;

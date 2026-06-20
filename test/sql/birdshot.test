@@ -981,3 +981,297 @@ query I
 SELECT birdshot_authorize('bsess', 'SELECT * FROM read_csv(''/etc/passwd'')');
 ----
 false
+
+# ============================================================================
+# Full-scope capability ACL (Phase 2): CREATE/DROP/ALTER catalog DDL + read_source/
+# copy_to/attach/install POLICY-gated resources, all authorized at the PARSE layer.
+# A fresh config grants a 'power' role the new capabilities so the ALLOW paths are
+# reachable (the suite above proves every new class still DENIES with no grant).
+# ============================================================================
+
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+# Catalog DDL capabilities: create in schema hn, create the hn2 schema, drop main.todos,
+# read main.todos (for a CTAS-from-catalog source).
+query I
+SELECT birdshot_add_role_grant('power', 'hn.*', 'create');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('power', 'hn2', 'create');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('power', 'main.todos', 'drop');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('power', 'main.todos', 'read');
+----
+ok
+
+# Non-catalog resource policies (default-deny: only listed resources pass).
+query I
+SELECT birdshot_add_source_policy('power', 'data.example.com');
+----
+ok
+
+query I
+SELECT birdshot_add_ext_policy('power', 'birdshot');
+----
+ok
+
+query I
+SELECT birdshot_add_attach_policy('power', 'lake.example.com');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('pat', 'power');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('pow-token', 'pat');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+query I
+SELECT birdshot_authenticate('psess', 'pow-token', '');
+----
+true
+
+# ---- CREATE (catalog DDL, capability-gated) --------------------------------
+
+# CREATE TABLE in a granted schema (create on hn.*) -> allow.
+query I
+SELECT birdshot_authorize('psess', 'CREATE TABLE hn.newt(id INT, title VARCHAR)');
+----
+true
+
+# CREATE TABLE in an UNGRANTED schema -> deny (no create on other.*).
+query I
+SELECT birdshot_authorize('psess', 'CREATE TABLE other.newt(id INT)');
+----
+false
+
+# CREATE SCHEMA with an exact create grant on that schema name -> allow.
+query I
+SELECT birdshot_authorize('psess', 'CREATE SCHEMA hn2');
+----
+true
+
+# CREATE SCHEMA without a matching grant -> deny.
+query I
+SELECT birdshot_authorize('psess', 'CREATE SCHEMA other2');
+----
+false
+
+# CREATE VIEW in a granted schema -> allow (create on hn.*).
+query I
+SELECT birdshot_authorize('psess', 'CREATE VIEW hn.v AS SELECT 1');
+----
+true
+
+# CREATE VIEW in an ungranted schema -> deny.
+query I
+SELECT birdshot_authorize('psess', 'CREATE VIEW other.v AS SELECT 1');
+----
+false
+
+# CREATE INDEX (resource model deferred to Phase 3) -> deny (fail closed).
+query I
+SELECT birdshot_authorize('psess', 'CREATE INDEX i ON hn.newt(id)');
+----
+false
+
+# ---- DROP / ALTER (catalog DDL) --------------------------------------------
+
+# DROP a table with a drop grant -> allow.
+query I
+SELECT birdshot_authorize('psess', 'DROP TABLE main.todos');
+----
+true
+
+# DROP an ungranted table -> deny (read/create grants do NOT cover drop).
+query I
+SELECT birdshot_authorize('psess', 'DROP TABLE secrets');
+----
+false
+
+# ALTER an ungranted table -> deny (no alter grant anywhere).
+query I
+SELECT birdshot_authorize('psess', 'ALTER TABLE main.todos RENAME TO t9');
+----
+false
+
+# ---- read_source (policy-gated FROM-clause table function) -----------------
+
+# read_csv over an ALLOWLISTED https host -> allow (source policy data.example.com).
+query I
+SELECT birdshot_authorize('psess', 'SELECT * FROM read_csv(''https://data.example.com/x.csv'')');
+----
+true
+
+# read_csv over a NON-allowlisted host -> deny (policy:read_source).
+query I
+SELECT birdshot_authorize('psess', 'SELECT * FROM read_csv(''https://evil.example/x.csv'')');
+----
+false
+
+# read_csv with a NON-CONSTANT source arg -> deny (can't pin the URI under live
+# egress; the SSRF/exfil guard fails closed).
+query I
+SELECT birdshot_authorize('psess', 'SELECT * FROM read_csv(concat(''https://data.example.com/'', ''x.csv''))');
+----
+false
+
+# bare file path (no https/quack scheme, no exact policy entry) -> deny.
+query I
+SELECT birdshot_authorize('psess', 'SELECT * FROM read_csv(''/etc/passwd'')');
+----
+false
+
+# ---- in-session ETL: CTAS = create + read_source in one governed statement -
+
+# CTAS into a granted schema FROM an allowlisted source -> allow (the ETL path).
+query I
+SELECT birdshot_authorize('psess', 'CREATE TABLE hn.stories AS SELECT * FROM read_csv(''https://data.example.com/hn.csv'')');
+----
+true
+
+# CTAS with a granted create target but a NON-allowlisted source -> deny.
+query I
+SELECT birdshot_authorize('psess', 'CREATE TABLE hn.stories AS SELECT * FROM read_csv(''https://evil.example/hn.csv'')');
+----
+false
+
+# CTAS into an UNGRANTED schema even from an allowlisted source -> deny (create gate).
+query I
+SELECT birdshot_authorize('psess', 'CREATE TABLE other.x AS SELECT * FROM read_csv(''https://data.example.com/x.csv'')');
+----
+false
+
+# CTAS from a catalog table the user may READ -> allow (create hn.* + read main.todos).
+query I
+SELECT birdshot_authorize('psess', 'CREATE TABLE hn.copy AS SELECT id, title FROM main.todos');
+----
+true
+
+# ---- install / attach (policy-gated) ---------------------------------------
+
+# INSTALL an allowlisted extension -> allow (ext policy 'birdshot').
+query I
+SELECT birdshot_authorize('psess', 'INSTALL birdshot');
+----
+true
+
+# INSTALL a non-allowlisted extension -> deny.
+query I
+SELECT birdshot_authorize('psess', 'INSTALL httpfs');
+----
+false
+
+# ATTACH an allowlisted https target -> allow (attach policy lake.example.com).
+query I
+SELECT birdshot_authorize('psess', 'ATTACH ''https://lake.example.com/db'' AS l');
+----
+true
+
+# ATTACH a bare local path -> deny (no exact policy entry; file paths default-deny).
+query I
+SELECT birdshot_authorize('psess', 'ATTACH ''evil.db'' AS x');
+----
+false
+
+# PRAGMA / SET stay deny-by-default (not made grantable in this phase).
+query I
+SELECT birdshot_authorize('psess', 'PRAGMA enable_profiling');
+----
+false
+
+# ============================================================================
+# Column constraints on the PARSE-AUTHORIZED path. When a statement carries a
+# read_source (or DDL), authorization is parse-level and the bind-walk is skipped,
+# so column allow-lists are enforced by EnforceConstraints over the parse-walk's
+# own column collection. A column-constrained read joined to a read_source must
+# still deny a forbidden column (this is the branch the unconstrained 'pat' tests
+# above never reach). NOTE (Phase 3): before column constraints and source/DDL
+# grants are emitted together in prod, catalog-table reads on this path should be
+# routed back through the bind-walk for struct/star/positional precision.
+# ============================================================================
+
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('colp', 'main.todos', 'read');
+----
+ok
+
+# Column allow-list: only `id` is readable on main.todos.
+query I
+SELECT birdshot_add_grant_constraint('colp', 'main.todos', 'id', NULL, NULL);
+----
+ok
+
+query I
+SELECT birdshot_add_source_policy('colp', 'allowed.example');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('colu', 'colp');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('col-token', 'colu');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+query I
+SELECT birdshot_authenticate('csess', 'col-token', '');
+----
+true
+
+# Allowed column read joined to an allowlisted read_source -> allow.
+query I
+SELECT birdshot_authorize('csess', 'SELECT id FROM main.todos, read_csv(''https://allowed.example/x.csv'')');
+----
+true
+
+# FORBIDDEN column (title not in {id}) on the parse-authorized path -> deny.
+# (Proves column constraints are enforced even when the bind-walk is skipped.)
+query I
+SELECT birdshot_authorize('csess', 'SELECT title FROM main.todos, read_csv(''https://allowed.example/x.csv'')');
+----
+false
