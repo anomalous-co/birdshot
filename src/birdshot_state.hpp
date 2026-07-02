@@ -327,6 +327,33 @@ public:
 
 	void Commit(); // promote staging -> live
 
+	// ---- direct-to-live mutation (native GRANT/REVOKE authoring surface) ------
+	// The ParserExtension GRANT/REVOKE statement (see birdshot_extension.cpp) mutates
+	// the LIVE snapshot IMMEDIATELY — no staging/Commit round-trip — so a GRANT takes
+	// effect on the very next authorize. These run ONLY from the table-function
+	// execution of a trusted-path GRANT/REVOKE (the wire authorize path can never
+	// reach them: it denies EXTENSION_STATEMENT / GRANT-shaped SQL fail-closed).
+	//
+	// cap_str / kind_str are re-validated fail-closed (ParseCapability / ParseObjKind):
+	// an unknown string is a silent no-op (never over-grant). resource_ref is lowercased
+	// to match the RefMatch invariant used by every other grant.
+	//
+	// KNOWN INTERACTION (spec §0, do NOT solve here): the gateway's applySnapshot does
+	// reset->add->Commit on live_, which clobbers these direct-live grants. That is a
+	// gateway reconcile concern; for standalone / tests direct-live is exactly right.
+	void GrantLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+	               const std::string &kind_str);
+	// birdshot's FIRST grant-removal primitive: erases every live grant on `role` whose
+	// (resource_ref, cap, kind) EXACTLY matches — the inverse of one GrantLive. Exact-ref
+	// (not RefMatch) so a REVOKE undoes precisely the grant a prior GRANT added.
+	void RevokeLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+	                const std::string &kind_str);
+	// Role membership (GRANT <role> TO <subject> / REVOKE <role> FROM <subject>).
+	// GrantRoleLive is idempotent (dedups); also used to attach a subject's singleton
+	// self-role so `TO <subject>` grants resolve through GrantsForUser.
+	void GrantRoleLive(const std::string &subject, const std::string &role);
+	void RevokeRoleLive(const std::string &subject, const std::string &role);
+
 	// ---- pluggable grant store (spec §0) -------------------------------------
 	// The in-memory State is always the hot read model for authorize; the store is
 	// an optional durable backend (a `grants` table in an ATTACHed catalog). These

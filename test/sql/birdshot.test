@@ -1713,3 +1713,266 @@ query I
 SELECT birdshot_authorize('ksess', 'SELECT birdshot_set_grant_store(''table'', ''x'')');
 ----
 false
+
+# ==========================================================================
+# Native GRANT / REVOKE statement (ParserExtension authoring surface)
+# ==========================================================================
+#
+# `GRANT …` / `REVOKE …` execute as real SQL (no birdshot_* call) and mutate the
+# LIVE grant store immediately (direct-to-live, no staging/commit). Self-contained
+# config block (appended last so no later commit clobbers these direct-live grants).
+
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('gsvc', 'grantee1');
+----
+ok
+
+# A subject whose id EQUALS an admin role name ("collide"), for the namespace
+# isolation test at the end. Committed here (service tokens are staged); the
+# collision GRANTs are direct-to-live later so this commit can't clobber them.
+query I
+SELECT birdshot_add_service_token('collide-tok', 'collide');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+statement ok
+CREATE TABLE main.gtab(id INT, title VARCHAR);
+
+statement ok
+CREATE TABLE main.gall(id INT, title VARCHAR);
+
+statement ok
+CREATE TABLE main.grole(id INT, title VARCHAR);
+
+query I
+SELECT birdshot_authenticate('gsess', 'gsvc', '');
+----
+true
+
+# ---- GRANT then REVOKE a table privilege (enforcement reflects each) ---------
+
+# Before any grant: default-deny.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gtab');
+----
+false
+
+# Native GRANT executes and emits a status row.
+query I
+GRANT SELECT ON main.gtab TO grantee1;
+----
+GRANT
+
+# Grant took effect immediately -> allow.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gtab');
+----
+true
+
+# Native REVOKE removes the exact grant -> back to deny.
+query I
+REVOKE SELECT ON main.gtab FROM grantee1;
+----
+REVOKE
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gtab');
+----
+false
+
+# ---- ALL PRIVILEGES expands to the object class's full cap set ---------------
+
+query I
+GRANT ALL PRIVILEGES ON main.gall TO grantee1;
+----
+GRANT
+
+# SELECT (read) covered.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gall');
+----
+true
+
+# INSERT (insert) covered by the same ALL PRIVILEGES grant.
+query I
+SELECT birdshot_authorize('gsess', 'INSERT INTO main.gall VALUES (1, ''x'')');
+----
+true
+
+# ---- role membership (GRANT <role> TO <subject>) + TO ROLE -------------------
+
+# Grant SELECT to a NAMED role (grantee1 is not a member yet).
+query I
+GRANT SELECT ON main.grole TO ROLE greaders;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.grole');
+----
+false
+
+# Add grantee1 to the role -> now covered.
+query I
+GRANT greaders TO grantee1;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.grole');
+----
+true
+
+# Revoke the membership -> deny again.
+query I
+REVOKE greaders FROM grantee1;
+----
+REVOKE
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.grole');
+----
+false
+
+# ---- THE WIRE-DENY SECURITY TEST (mandatory) --------------------------------
+#
+# An authenticated non-admin session must NEVER be able to grant itself access by
+# submitting a GRANT over the authorize path. The parse-walk pre-filter denies the
+# EXTENSION_STATEMENT / GRANT-shaped SQL fail-closed BEFORE any bind/plan/execution.
+
+# gtab is currently NOT granted to grantee1 (revoked above). A wire GRANT is denied…
+query I
+SELECT birdshot_authorize('gsess', 'GRANT SELECT ON main.gtab TO grantee1');
+----
+false
+
+# …AND it did not take effect: the subsequent SELECT is still denied.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gtab');
+----
+false
+
+# Wire REVOKE is denied too (same gate).
+query I
+SELECT birdshot_authorize('gsess', 'REVOKE ALL PRIVILEGES ON main.gall FROM grantee1');
+----
+false
+
+# The wire REVOKE was ineffective: grantee1 still holds ALL PRIVILEGES on gall.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gall');
+----
+true
+
+# ---- fail-closed parse errors (unknown / unenforced privilege; deferred) -----
+
+# Unenforced PG privilege -> hard error (never a silent drop).
+statement error
+GRANT TRIGGER ON main.gtab TO grantee1;
+----
+unknown or unenforced privilege
+
+# Typo'd privilege -> hard error.
+statement error
+GRANT SELCT ON main.gtab TO grantee1;
+----
+unknown or unenforced privilege
+
+# Column list is deferred -> clear error.
+statement error
+GRANT SELECT (id) ON main.gtab TO grantee1;
+----
+column lists are not supported
+
+# WITH GRANT OPTION is deferred -> clear error.
+statement error
+GRANT SELECT ON main.gtab TO grantee1 WITH GRANT OPTION;
+----
+WITH GRANT
+
+# PUBLIC grantee is deferred -> clear error.
+statement error
+GRANT SELECT ON main.gtab TO PUBLIC;
+----
+PUBLIC
+
+# Malformed (no grantee) -> error.
+statement error
+GRANT SELECT ON main.gtab TO;
+----
+birdshot GRANT
+
+# ---- multi-grantee (TO a, ROLE r) in one statement --------------------------
+
+statement ok
+CREATE TABLE main.gmulti(id INT);
+
+# One GRANT to a subject AND a named role at once.
+query I
+GRANT SELECT ON main.gmulti TO grantee1, ROLE gmrole;
+----
+GRANT
+
+# The subject grantee (grantee1) is covered.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gmulti');
+----
+true
+
+# ---- subject/role namespace isolation (advisor Finding A) --------------------
+# A subject id that happens to equal an admin ROLE name must NOT inherit that
+# role's grants. `TO <subject>` stores the grant under a namespaced self-role, so
+# subject "collide" and role "collide" live in disjoint keyspaces. Before the fix
+# this leaked the role's grant to the subject (privilege escalation).
+
+statement ok
+CREATE TABLE main.gsensitive(id INT);
+
+statement ok
+CREATE TABLE main.gbenign(id INT);
+
+# Admin grants a SENSITIVE privilege to the ROLE named "collide".
+query I
+GRANT SELECT ON main.gsensitive TO ROLE collide;
+----
+GRANT
+
+# A BENIGN privilege is granted to the SUBJECT "collide" (same string as the role).
+query I
+GRANT SELECT ON main.gbenign TO collide;
+----
+GRANT
+
+# Authenticate a session for user "collide" (token committed in the setup block).
+query I
+SELECT birdshot_authenticate('csess', 'collide-tok', '');
+----
+true
+
+# The subject gets its OWN direct grant (gbenign) -> allow.
+query I
+SELECT birdshot_authorize('csess', 'SELECT * FROM main.gbenign');
+----
+true
+
+# But it must NOT inherit ROLE "collide"'s grant (gsensitive) -> deny.
+# (Pre-fix this returned true = escalation.)
+query I
+SELECT birdshot_authorize('csess', 'SELECT * FROM main.gsensitive');
+----
+false

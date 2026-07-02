@@ -477,6 +477,40 @@ Findings from the advisor pass, and dispositions:
 depfiles — verified empirically (touching `birdshot_state.hpp` recompiles `birdshot_extension.cpp.o`).
 `make release && make test` after a header edit is sufficient; no forced object delete needed.
 
+## 11. Phase 3a — native `GRANT`/`REVOKE` ParserExtension (2026-07-02)
+
+**Landed in the working tree, `make test` = 324 assertions green.** The authoring surface: `GRANT …` /
+`REVOKE …` execute as real SQL via a DuckDB `ParserExtension` — **no `birdshot_*` call** — mutating the
+live store immediately, standalone (bare `LOAD birdshot`, no gateway). Delegation (`WITH GRANT OPTION`,
+wire-authorized admin grants, cascade) remains Phase 3b; every wire GRANT is denied.
+
+- **The security gate is parse-failure → deny (not the `EXTENSION_STATEMENT` case).** `Analyze` (the
+  authorize pre-filter) builds a **bare `Parser`** with no extensions, so `GRANT …` throws in
+  `ParseQuery` and is denied as `forbidden_grant_stmt` BEFORE any bind/plan/execution. The
+  `EXTENSION_STATEMENT` case in `AnalyzeStatement` is defense-in-depth (fires only if `Analyze` ever
+  becomes context-aware). Proven in-process: a wire GRANT is denied AND ineffective (the subsequent
+  SELECT still denies); same for wire REVOKE.
+- **Mutation only at execution.** `parse_function`/`plan_function`/table-function `bind` are
+  side-effect-free; the store changes only in the exec `function` callback. `bind` staying pure is a
+  **protected invariant** (commented in code): quack binds at PREPARE, before authorize denies — a
+  mutation in `bind` would run pre-deny = critical bypass.
+- **FIXED (advisor Finding A) — subject/role namespace collision.** `TO <subject>` now stores under a
+  reserved-prefix self-role (`\x1d` + `subj:` + id) that admin role names can't collide with, closing
+  an escalation where a JWT `sub` equal to a role name inherited that role's grants. Regression-tested.
+- **Grammar**: supported — `GRANT/REVOKE <privs|ALL [PRIVILEGES]> ON [<kind>] <ref> TO/FROM <grantee>`
+  (multi-grantee; `<grantee>` = subject or `ROLE r`), role membership `GRANT/REVOKE <role> TO/FROM x`.
+  Deferred with a HARD error (never silent): column lists, `ALL … IN SCHEMA`, `PUBLIC`, `CURRENT_USER`,
+  `WITH GRANT OPTION`, `GRANTED BY`, `CASCADE/RESTRICT`; unknown/unenforced privileges (TRIGGER/…) too.
+- **`RevokeLive`** — birdshot's first removal primitive: erases grants whose `(ref, cap, kind)` exactly
+  matches one `GrantLive` (exact ref, not `RefMatch`). Known: a kind-mismatched REVOKE (grant SEQUENCE,
+  revoke default TABLE) removes nothing — consistent with the kind discriminator, vacuous today (only
+  TABLE enforced), but Phase 2 must not inherit it as a silent hole.
+- **Verification caveat (honest)**: enforcement is proven **in-process** (`make test`). Wire enforcement
+  depends on quack calling `birdshot_authorize` before execution — proven for existing statement types
+  by the e2e suite, but the GRANT path's wire deny is **not yet exercised by `make test-e2e`**. In-process
+  verified; wire-enforced security pending an e2e case. The `bind`-purity invariant is what protects the
+  wire path structurally in the meantime.
+
 ## Primary sources
 - Capability model / Covers / ParseCapability: `src/birdshot_state.hpp:48-108`
 - Grant / GrantConstraint structs: `src/birdshot_state.hpp:118,128`

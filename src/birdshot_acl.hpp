@@ -807,6 +807,19 @@ inline bool AnalyzeStatement(const duckdb::SQLStatement &stmt, WalkCtx &ctx) {
 		// BEGIN/COMMIT/ROLLBACK — needed for forwarded transactions. No tables.
 		return true;
 
+	case StatementType::EXTENSION_STATEMENT:
+		// A registered ParserExtension statement — birdshot's own native GRANT/REVOKE.
+		// A wire GRANT would let an agent grant itself access: NEVER allowed. Fail closed.
+		//
+		// DEFENSE IN DEPTH: this case fires only if Analyze ever runs a context-aware
+		// parser. The live wire authorize path builds a BARE `Parser parser;`
+		// (options.extensions == nullptr), so `GRANT …` throws in ParseQuery and is
+		// denied as a parse failure BEFORE reaching here — see the catch in Analyze(),
+		// which relabels a GRANT/REVOKE-shaped parse failure to `forbidden_grant_stmt`.
+		ctx.forbidden = true;
+		ctx.reason = "forbidden_grant_stmt";
+		return false;
+
 	// ---- Full-scope capability classes (authorized at the parse layer) ----------
 
 	case StatementType::CREATE_STATEMENT: {
@@ -1001,6 +1014,23 @@ inline bool AnalyzeStatement(const duckdb::SQLStatement &stmt, WalkCtx &ctx) {
 	}
 }
 
+// True iff `sql`'s first whitespace-delimited word is GRANT or REVOKE (case-
+// insensitive). Used ONLY to label a parse FAILURE — birdshot's native GRANT/REVOKE
+// fails the bare parser used here (it carries no ParserExtension), so a GRANT-shaped
+// string that fails to parse is a wire attempt to run the statement and is denied
+// with an unambiguous reason. (Valid SQL never reaches the catch, so this can never
+// mislabel a legitimate query.)
+inline bool LooksLikeGrantOrRevoke(const std::string &sql) {
+	size_t i = 0;
+	while (i < sql.size() && ::isspace(static_cast<unsigned char>(sql[i])))
+		i++;
+	size_t j = i;
+	while (j < sql.size() && !::isspace(static_cast<unsigned char>(sql[j])))
+		j++;
+	std::string w = LowerCopy(sql.substr(i, j - i));
+	return w == "grant" || w == "revoke";
+}
+
 inline AclAnalysis Analyze(const std::string &sql) {
 	using namespace duckdb;
 	AclAnalysis a;
@@ -1008,8 +1038,16 @@ inline AclAnalysis Analyze(const std::string &sql) {
 	try {
 		parser.ParseQuery(sql);
 	} catch (...) {
-		a.cls = AclClass::PARSE_ERR;
-		a.reason = "parse_error";
+		// A native GRANT/REVOKE typed over the wire fails this bare parser (no
+		// extensions registered here). Deny it with a precise reason; every other
+		// unparseable string stays a generic parse_error. Either way: fail closed.
+		if (LooksLikeGrantOrRevoke(sql)) {
+			a.cls = AclClass::FORBIDDEN;
+			a.reason = "forbidden_grant_stmt";
+		} else {
+			a.cls = AclClass::PARSE_ERR;
+			a.reason = "parse_error";
+		}
 		return a;
 	}
 	if (parser.statements.empty()) {

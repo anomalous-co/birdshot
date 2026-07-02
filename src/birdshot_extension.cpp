@@ -10,6 +10,10 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -17,6 +21,7 @@
 #include "duckdb/parser/column_list.hpp"
 #include "duckdb/common/enums/on_entry_not_found.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <sstream>
@@ -188,6 +193,62 @@ void State::Commit() {
 	std::lock_guard<std::mutex> lk(mtx_);
 	live_ = staging_;
 	staging_ = PolicySnapshot();
+}
+
+// ---- direct-to-live mutation (native GRANT/REVOKE) -------------------------
+// These write live_ directly (no staging) so a GRANT takes effect on the next
+// authorize. Reachable ONLY from the trusted-path GRANT/REVOKE table function.
+void State::GrantLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+                      const std::string &kind_str) {
+	Capability cap;
+	if (!ParseCapability(cap_str, cap))
+		return; // unknown capability -> fail-closed no-op (never over-grant)
+	ObjKind kind;
+	if (!ParseObjKind(kind_str, kind))
+		return; // unknown object kind -> fail-closed no-op
+	std::lock_guard<std::mutex> lk(mtx_);
+	Grant g;
+	g.resource_ref = LowerCopy(resource_ref);
+	g.cap = cap;
+	g.kind = kind;
+	live_.role_grants[role].push_back(g);
+}
+void State::RevokeLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+                       const std::string &kind_str) {
+	Capability cap;
+	if (!ParseCapability(cap_str, cap))
+		return; // unknown capability -> nothing could match; safe no-op
+	ObjKind kind;
+	if (!ParseObjKind(kind_str, kind))
+		return;
+	std::string ref = LowerCopy(resource_ref);
+	std::lock_guard<std::mutex> lk(mtx_);
+	auto it = live_.role_grants.find(role);
+	if (it == live_.role_grants.end())
+		return;
+	auto &v = it->second;
+	// Erase every grant whose (ref, cap, kind) exactly matches — the inverse of GrantLive.
+	v.erase(std::remove_if(v.begin(), v.end(),
+	                       [&](const Grant &g) {
+		                       return g.resource_ref == ref && g.cap == cap && g.kind == kind;
+	                       }),
+	        v.end());
+}
+void State::GrantRoleLive(const std::string &subject, const std::string &role) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	auto &roles = live_.user_roles[subject];
+	for (const auto &r : roles)
+		if (r == role)
+			return; // idempotent: already a member
+	roles.push_back(role);
+}
+void State::RevokeRoleLive(const std::string &subject, const std::string &role) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	auto it = live_.user_roles.find(subject);
+	if (it == live_.user_roles.end())
+		return;
+	auto &v = it->second;
+	v.erase(std::remove(v.begin(), v.end(), role), v.end());
 }
 
 void State::PutSession(const std::string &sid, Identity id) {
@@ -1155,6 +1216,439 @@ static void StatusFn(DataChunk &args, ExpressionState &state, Vector &result) {
 		SetStrResult(result, i, s);
 }
 
+// ======================= native GRANT / REVOKE statement ====================
+//
+// A DuckDB ParserExtension exposing real `GRANT …` / `REVOKE …` SQL. GRANT/REVOKE
+// are Postgres keyword tokens with NO grammar production, so they fail DuckDB's
+// built-in parser and are handed to this extension's parse_function.
+//
+// SECURITY (the whole point): registering this makes GRANT parse on EVERY
+// connection, including untrusted agent wire connections. The wire authorize path
+// (birdshot_authorize -> Analyze) denies GRANT fail-closed BEFORE any bind/plan/
+// execution (the bare parser in Analyze throws -> `forbidden_grant_stmt` deny; the
+// EXTENSION_STATEMENT case in AnalyzeStatement is defense-in-depth). Mutation of the
+// grant store happens ONLY in this table function's EXECUTION callback — never in
+// parse_function or plan_function (which run at parse/plan time and stay pure). So a
+// GRANT only ever mutates when a TRUSTED connection (bare CLI / the gateway's own
+// privileged connection, which does NOT self-authorize) actually executes it.
+//
+// Grammar supported (curated subset of PostgreSQL, spec §5/§8):
+//   GRANT  <privlist|ALL [PRIVILEGES]> ON [<objkind>] <ref> TO   <grantee>[, …]
+//   REVOKE <privlist|ALL [PRIVILEGES]> ON [<objkind>] <ref> FROM <grantee>[, …]
+//   GRANT  <rolename> TO   <grantee>[, …]     (role membership — no ON)
+//   REVOKE <rolename> FROM <grantee>[, …]
+// privileges  -> SELECT/INSERT/UPDATE/DELETE/TRUNCATE/CREATE/DROP/ALTER/USAGE/EXECUTE
+// <objkind>   -> optional TABLE/VIEW/SEQUENCE/FUNCTION/TYPE/SCHEMA/DATABASE (default TABLE)
+// <grantee>   -> a bare identifier (a subject) or `ROLE <name>`
+// FAIL-CLOSED: an unknown/unenforced privilege (TRIGGER/REFERENCES/…), or any
+// malformed input, returns a DISPLAY_EXTENSION_ERROR — never a silent drop.
+// DEFERRED (clear error): column lists `(c,…)`, ALL … IN SCHEMA, PUBLIC, CURRENT_USER,
+// GRANTED BY, WITH GRANT OPTION, CASCADE/RESTRICT.
+
+// One resolved store mutation, serialized into a single tab-delimited line. Codes:
+//   g\t<role>\t<is_subject 0/1>\t<ref>\t<kind>\t<cap>   grant a privilege
+//   r\t<role>\t<is_subject 0/1>\t<ref>\t<kind>\t<cap>   revoke a privilege
+//   gr\t<subject>\t<role>                               grant role membership
+//   rr\t<subject>\t<role>                               revoke role membership
+// Identifiers come from a whitespace/comma tokenizer, so they never contain \t or \n.
+
+static std::string GrantLower(const std::string &s) {
+	std::string o = s;
+	for (auto &c : o)
+		c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+	return o;
+}
+
+// Tokenize into words, emitting ',' '(' ')' as standalone tokens and dropping ';'.
+static vector<std::string> GrantTokenize(const std::string &sql) {
+	vector<std::string> toks;
+	std::string cur;
+	auto flush = [&]() {
+		if (!cur.empty()) {
+			toks.push_back(cur);
+			cur.clear();
+		}
+	};
+	for (char c : sql) {
+		unsigned char uc = static_cast<unsigned char>(c);
+		if (::isspace(uc)) {
+			flush();
+		} else if (c == ',' || c == '(' || c == ')') {
+			flush();
+			toks.push_back(std::string(1, c));
+		} else if (c == ';') {
+			flush(); // statement terminator — separator only
+		} else {
+			cur += c;
+		}
+	}
+	flush();
+	return toks;
+}
+
+static bool GrantIsObjKind(const std::string &l) {
+	return l == "table" || l == "view" || l == "sequence" || l == "function" || l == "type" || l == "schema" ||
+	       l == "database";
+}
+
+// Map a PG privilege token -> birdshot capability spelling. Only the ENFORCED set.
+static bool GrantPrivToCap(const std::string &priv, std::string &cap_out) {
+	if (priv == "select")   { cap_out = "read";     return true; }
+	if (priv == "insert")   { cap_out = "insert";   return true; }
+	if (priv == "update")   { cap_out = "update";   return true; }
+	if (priv == "delete")   { cap_out = "delete";   return true; }
+	if (priv == "truncate") { cap_out = "truncate"; return true; }
+	if (priv == "create")   { cap_out = "create";   return true; }
+	if (priv == "drop")     { cap_out = "drop";     return true; }
+	if (priv == "alter")    { cap_out = "alter";    return true; }
+	if (priv == "usage")    { cap_out = "usage";    return true; }
+	if (priv == "execute")  { cap_out = "execute";  return true; }
+	return false; // TRIGGER / REFERENCES / MAINTAIN / typo / … -> caller rejects
+}
+
+// ALL [PRIVILEGES] expansion for an object class (the class's applicable caps).
+static vector<std::string> GrantAllCapsForKind(const std::string &kind) {
+	if (kind == "table" || kind == "view")
+		return {"read", "insert", "update", "delete", "truncate"};
+	if (kind == "sequence")
+		return {"usage"};
+	if (kind == "function")
+		return {"execute"};
+	if (kind == "type")
+		return {"usage"};
+	if (kind == "schema")
+		return {"usage", "create"};
+	if (kind == "database")
+		return {"create"};
+	return {};
+}
+
+struct BirdshotGrantParseData : public ParserExtensionParseData {
+	std::string verb;        // "GRANT" | "REVOKE" (status row)
+	vector<std::string> ops; // serialized mutation lines (see codes above)
+
+	BirdshotGrantParseData(std::string verb_p, vector<std::string> ops_p)
+	    : verb(std::move(verb_p)), ops(std::move(ops_p)) {
+	}
+	duckdb::unique_ptr<ParserExtensionParseData> Copy() const override {
+		return make_uniq<BirdshotGrantParseData>(verb, ops);
+	}
+	std::string ToString() const override {
+		return verb + "(" + std::to_string(ops.size()) + " ops)";
+	}
+};
+
+// A grantee: a bare subject id, or a named role (`ROLE r`).
+struct GrantGrantee {
+	std::string name;
+	bool is_subject;
+};
+
+// Parse a grantee list (comma-separated `<ident>` or `ROLE <ident>`). Returns false
+// (caller rejects) on any malformed segment or an empty list.
+static bool GrantParseGrantees(const vector<std::string> &toks, size_t begin, vector<GrantGrantee> &out) {
+	vector<std::string> seg;
+	auto emit = [&]() -> bool {
+		if (seg.size() == 1) {
+			out.push_back(GrantGrantee {seg[0], true});
+		} else if (seg.size() == 2 && GrantLower(seg[0]) == "role") {
+			out.push_back(GrantGrantee {seg[1], false});
+		} else {
+			return false;
+		}
+		seg.clear();
+		return true;
+	};
+	for (size_t i = begin; i < toks.size(); i++) {
+		if (toks[i] == ",") {
+			if (!emit())
+				return false;
+		} else {
+			seg.push_back(toks[i]);
+		}
+	}
+	if (!seg.empty() && !emit())
+		return false;
+	return !out.empty();
+}
+
+static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, const string &query) {
+	auto toks = GrantTokenize(query);
+	if (toks.empty())
+		return ParserExtensionParseResult(); // DISPLAY_ORIGINAL_ERROR (not ours)
+	std::string t0 = GrantLower(toks[0]);
+	bool is_grant = (t0 == "grant");
+	bool is_revoke = (t0 == "revoke");
+	if (!is_grant && !is_revoke)
+		return ParserExtensionParseResult(); // not a GRANT/REVOKE — let DuckDB's error stand
+	// From here it IS ours: every failure is a DISPLAY_EXTENSION_ERROR (fail-closed).
+	auto err = [](const std::string &m) { return ParserExtensionParseResult("birdshot GRANT: " + m); };
+
+	// Reject deferred / unsupported constructs up front (clear error, never a silent drop).
+	for (const auto &tk : toks) {
+		if (tk == "(" || tk == ")")
+			return err("column lists are not supported yet");
+		std::string l = GrantLower(tk);
+		if (l == "public")
+			return err("PUBLIC grantee is not supported yet");
+		if (l == "current_user" || l == "current_role" || l == "session_user")
+			return err("CURRENT_USER/CURRENT_ROLE grantee is not supported yet");
+		if (l == "with")
+			return err("WITH GRANT/ADMIN OPTION is not supported yet");
+		if (l == "granted")
+			return err("GRANTED BY is not supported yet");
+		if (l == "cascade" || l == "restrict")
+			return err("CASCADE/RESTRICT is not supported yet");
+		if (l == "in")
+			return err("ALL … IN SCHEMA is not supported yet");
+	}
+
+	const std::string kw = is_grant ? "to" : "from"; // GRANT … TO … / REVOKE … FROM …
+	int on_idx = -1, kw_idx = -1;
+	for (size_t i = 1; i < toks.size(); i++) {
+		std::string l = GrantLower(toks[i]);
+		if (l == "on" && on_idx < 0)
+			on_idx = static_cast<int>(i);
+		if (l == kw && kw_idx < 0)
+			kw_idx = static_cast<int>(i);
+	}
+	if (kw_idx < 0)
+		return err(std::string("expected ") + (is_grant ? "TO" : "FROM"));
+
+	vector<std::string> ops;
+
+	if (on_idx < 0) {
+		// ---- role membership: GRANT <role> TO <grantees> / REVOKE <role> FROM <grantees> ----
+		if (kw_idx != 2)
+			return err("expected a single role name before " + GrantLower(kw));
+		std::string role = toks[1];
+		vector<GrantGrantee> grantees;
+		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantees))
+			return err("malformed grantee list");
+		const char *code = is_grant ? "gr" : "rr";
+		for (const auto &g : grantees)
+			ops.push_back(std::string(code) + "\t" + g.name + "\t" + role);
+	} else {
+		// ---- privilege grant/revoke ----
+		if (on_idx <= 1)
+			return err("expected privileges before ON");
+		if (kw_idx <= on_idx)
+			return err(std::string("expected ") + (is_grant ? "TO" : "FROM") + " after the object");
+
+		// privileges: toks(1 .. on_idx)
+		bool all_mode = false;
+		vector<std::string> caps;
+		vector<std::string> priv_toks;
+		for (int i = 1; i < on_idx; i++) {
+			if (toks[i] == ",")
+				continue;
+			priv_toks.push_back(GrantLower(toks[i]));
+		}
+		if (priv_toks.empty())
+			return err("expected a privilege list");
+		if (priv_toks[0] == "all") {
+			all_mode = true;
+			if (priv_toks.size() == 2 && priv_toks[1] != "privileges")
+				return err("unexpected token after ALL");
+			if (priv_toks.size() > 2)
+				return err("unexpected tokens after ALL PRIVILEGES");
+		} else {
+			for (const auto &p : priv_toks) {
+				std::string cap;
+				if (!GrantPrivToCap(p, cap))
+					return err("unknown or unenforced privilege '" + p + "'");
+				caps.push_back(cap);
+			}
+		}
+
+		// object: toks(on_idx+1 .. kw_idx) = [<objkind>] <ref>
+		vector<std::string> obj_toks;
+		for (int i = on_idx + 1; i < kw_idx; i++) {
+			if (toks[i] == ",")
+				return err("only a single object is supported");
+			obj_toks.push_back(toks[i]);
+		}
+		std::string kind = "table";
+		std::string ref;
+		if (obj_toks.size() == 1) {
+			if (GrantIsObjKind(GrantLower(obj_toks[0])))
+				return err("expected an object name after the object kind");
+			ref = obj_toks[0];
+		} else if (obj_toks.size() == 2 && GrantIsObjKind(GrantLower(obj_toks[0]))) {
+			kind = GrantLower(obj_toks[0]);
+			ref = obj_toks[1];
+		} else {
+			return err("could not parse the object reference");
+		}
+
+		if (all_mode) {
+			caps = GrantAllCapsForKind(kind);
+			if (caps.empty())
+				return err("ALL PRIVILEGES is not supported for " + kind);
+		}
+
+		vector<GrantGrantee> grantees;
+		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantees))
+			return err("malformed grantee list");
+
+		// NOTE (spec §1c, documented deferral): SCHEMA/DATABASE refs are stored VERBATIM.
+		// Wildcard domination (`ON SCHEMA s` covering objects in s) is NOT expanded here —
+		// a verbatim schema ref simply fails to RefMatch object uses, so it is inert
+		// (under-grant = fail-safe). Enforced privilege×object combos on named TABLE/VIEW/
+		// SEQUENCE/FUNCTION/TYPE objects are the covered set.
+		const char *code = is_grant ? "g" : "r";
+		for (const auto &g : grantees)
+			for (const auto &cap : caps)
+				ops.push_back(std::string(code) + "\t" + g.name + "\t" + (g.is_subject ? "1" : "0") + "\t" + ref +
+				              "\t" + kind + "\t" + cap);
+	}
+
+	if (ops.empty())
+		return err("nothing to do");
+	return ParserExtensionParseResult(make_uniq<BirdshotGrantParseData>(is_grant ? "GRANT" : "REVOKE", std::move(ops)));
+}
+
+// ---- the exec table function (mutation happens HERE, at execution) ----------
+
+struct BirdshotGrantExecBindData : public TableFunctionData {
+	std::string ops_blob; // '\n'-joined op lines
+	std::string verb;
+	BirdshotGrantExecBindData(std::string ops_p, std::string verb_p)
+	    : ops_blob(std::move(ops_p)), verb(std::move(verb_p)) {
+	}
+};
+struct BirdshotGrantExecGlobalState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static void GrantSplit(const std::string &s, char delim, vector<std::string> &out) {
+	out.clear();
+	size_t start = 0;
+	while (true) {
+		size_t p = s.find(delim, start);
+		if (p == std::string::npos) {
+			out.push_back(s.substr(start));
+			break;
+		}
+		out.push_back(s.substr(start, p - start));
+		start = p + 1;
+	}
+}
+
+// Apply the serialized ops to birdshot's live store. Called ONLY from execution.
+// Reserved namespace for a subject's implicit singleton self-role (grantee `TO <subject>`).
+// The leading 0x1D (GROUP SEPARATOR) control byte cannot appear in an admin-defined role
+// name (role names are SQL identifiers / compiler-generated), so a subject id can NEVER
+// collide with a role name. Without this, `GRANT p ON t TO alice` (subject) would write
+// role_grants["alice"] and make subject "alice" a member of role "alice" — so a JWT `sub`
+// equal to an existing admin role name would silently inherit that role's grants
+// (escalation, advisor Finding A). subject ids are attacker-influenceable at some IdPs;
+// role names are admin-chosen; nothing else guarantees them disjoint.
+static std::string SubjectSelfRole(const std::string &subject) {
+	return std::string("\x1d") + "subj:" + subject;
+}
+
+static void BirdshotApplyGrantOps(const std::string &blob) {
+	auto &st = State::Get();
+	vector<std::string> lines;
+	GrantSplit(blob, '\n', lines);
+	for (const auto &line : lines) {
+		if (line.empty())
+			continue;
+		vector<std::string> f;
+		GrantSplit(line, '\t', f);
+		if (f.empty())
+			continue;
+		const std::string &code = f[0];
+		if (code == "g" && f.size() == 6) {
+			const std::string &name = f[1];
+			bool is_subject = (f[2] == "1");
+			// A subject grantee is stored under its NAMESPACED self-role (never the raw
+			// subject id) so it can't collide with an admin role name. REVOKE below uses the
+			// same mapping, so GRANT/REVOKE stay symmetric.
+			std::string role_key = is_subject ? SubjectSelfRole(name) : name;
+			if (is_subject)
+				st.GrantRoleLive(name, role_key); // attach the subject to its namespaced self-role
+			st.GrantLive(role_key, f[3], f[5], f[4]);
+		} else if (code == "r" && f.size() == 6) {
+			bool is_subject = (f[2] == "1");
+			std::string role_key = is_subject ? SubjectSelfRole(f[1]) : f[1];
+			st.RevokeLive(role_key, f[3], f[5], f[4]);
+		} else if (code == "gr" && f.size() == 3) {
+			st.GrantRoleLive(f[1], f[2]);
+		} else if (code == "rr" && f.size() == 3) {
+			st.RevokeRoleLive(f[1], f[2]);
+		}
+		// Any other shape: ignore (fail-closed; parse produced only the shapes above).
+	}
+}
+
+static duckdb::unique_ptr<FunctionData> BirdshotGrantExecBind(ClientContext &, TableFunctionBindInput &input,
+                                                              vector<LogicalType> &return_types,
+                                                              vector<string> &names) {
+	names.emplace_back("birdshot");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	// PROTECTED INVARIANT — bind MUST stay side-effect-free. Quack prepares/binds at
+	// PREPARE_REQUEST, which parses GRANT into an ExtensionStatement and calls this bind
+	// BEFORE birdshot_authorize gets to deny it. The entire wire-safety argument (an agent
+	// can't self-grant) rests on the mutation happening ONLY in the execution callback,
+	// which the authorize deny prevents the wire from ever reaching. Moving any store
+	// mutation into bind would run it at prepare-time, before the deny — a critical bypass.
+	// NO mutation here — just carry the payload to execution.
+	std::string ops = input.inputs[0].IsNull() ? "" : StringValue::Get(input.inputs[0]);
+	std::string verb = input.inputs[1].IsNull() ? "" : StringValue::Get(input.inputs[1]);
+	return make_uniq<BirdshotGrantExecBindData>(std::move(ops), std::move(verb));
+}
+static duckdb::unique_ptr<GlobalTableFunctionState> BirdshotGrantExecInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<BirdshotGrantExecGlobalState>();
+}
+static void BirdshotGrantExecFunc(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<BirdshotGrantExecBindData>();
+	auto &gstate = data_p.global_state->Cast<BirdshotGrantExecGlobalState>();
+	if (gstate.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	// THE mutation: applied exactly once, at execution, on the connection that
+	// reached execution (a trusted path — the wire authorize path never gets here).
+	BirdshotApplyGrantOps(bind_data.ops_blob);
+	output.SetValue(0, 0, Value(bind_data.verb));
+	output.SetCardinality(1);
+	gstate.done = true;
+}
+
+static TableFunction BirdshotGrantExecTableFunction() {
+	TableFunction tf("birdshot_grant_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, BirdshotGrantExecFunc,
+	                 BirdshotGrantExecBind, BirdshotGrantExecInit);
+	return tf;
+}
+
+static ParserExtensionPlanResult BirdshotGrantPlan(ParserExtensionInfo *, ClientContext &,
+                                                   duckdb::unique_ptr<ParserExtensionParseData> parse_data) {
+	auto &pd = static_cast<BirdshotGrantParseData &>(*parse_data);
+	// PURE: serialize the resolved ops into table-function parameters. No mutation here.
+	std::string blob;
+	for (size_t i = 0; i < pd.ops.size(); i++) {
+		if (i)
+			blob += "\n";
+		blob += pd.ops[i];
+	}
+	ParserExtensionPlanResult result;
+	result.function = BirdshotGrantExecTableFunction();
+	result.parameters.push_back(Value(blob));
+	result.parameters.push_back(Value(pd.verb));
+	result.requires_valid_transaction = false; // birdshot state is separate from DuckDB storage
+	result.return_type = StatementReturnType::QUERY_RESULT;
+	return result;
+}
+
+static ParserExtension BirdshotGrantParserExtension() {
+	ParserExtension ext;
+	ext.parse_function = BirdshotGrantParse;
+	ext.plan_function = BirdshotGrantPlan;
+	return ext;
+}
+
 // ============================ registration ==================================
 
 static void Register(ExtensionLoader &loader, const std::string &name, const vector<LogicalType> &args,
@@ -1200,6 +1694,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Audit + status.
 	Register(loader, "birdshot_log_drain", {I}, V, LogDrainFn);
 	Register(loader, "birdshot_status", {}, V, StatusFn);
+
+	// Native GRANT / REVOKE statement (ParserExtension). Registered on the DBConfig so
+	// `GRANT …` / `REVOKE …` parse + execute as real SQL. The wire authorize path
+	// denies GRANT fail-closed (birdshot_acl.hpp); mutation happens only in the exec
+	// table function (trusted-path execution).
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	ParserExtension::Register(config, BirdshotGrantParserExtension());
 }
 
 void BirdshotExtension::Load(ExtensionLoader &loader) {
