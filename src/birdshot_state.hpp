@@ -211,7 +211,30 @@ struct Grant {
 	// (pushed with no kind) keeps its exact current meaning. A use is satisfied
 	// only by a grant whose kind KindMatch()es it (spec §1c).
 	ObjKind kind = ObjKind::TABLE;
+	// ---- delegation fields (spec §4/§8f) — STORED now, ENFORCED in Phase 3b ----
+	// `grant_option` records `WITH GRANT OPTION`: the grantee may re-grant this
+	// privilege. It is INERT today — there is no wire-authorized GRANT path yet, so
+	// nothing consults it — but storing it is the round-trip/authoring deliverable.
+	// `grantor` records `GRANTED BY <role>`. Also inert until cascade REVOKE (Phase
+	// 3b) walks the grantor→grantee graph. Neither field participates in enforcement
+	// (Covers/RefMatch/KindMatch), so a mis-set value can never over-grant.
+	bool grant_option = false;
+	std::string grantor;
 };
+
+// ---- reserved pseudo-role keys ---------------------------------------------
+//
+// The leading 0x1D (GROUP SEPARATOR) control byte can NEVER appear in an admin-
+// defined role name (role names are SQL identifiers / compiler-generated) nor in a
+// subject id used as a raw role key, so these reserved keys live in a keyspace that
+// no real role or subject can collide with (same technique as SubjectSelfRole).
+//
+// PublicRole() is the pseudo-role every authenticated identity implicitly holds:
+// `GRANT … TO PUBLIC` writes role_grants[PublicRole()], and GrantsForUser /
+// ConstraintsForUser / *PoliciesForUser merge it in for EVERY user (spec §8d).
+inline std::string PublicRole() {
+	return std::string("\x1d") + "public";
+}
 
 // A finer-grained constraint attached to a role, scoped to one table. Layered on
 // top of the coarse table grant above: a column allow-list and a UTC time window.
@@ -342,7 +365,22 @@ public:
 	// reset->add->Commit on live_, which clobbers these direct-live grants. That is a
 	// gateway reconcile concern; for standalone / tests direct-live is exactly right.
 	void GrantLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
-	               const std::string &kind_str);
+	               const std::string &kind_str, bool grant_option = false, const std::string &grantor = "");
+	// Column-list GRANT constraint (native `GRANT SELECT (c1,c2) ON t …`). Direct-to-live
+	// mirror of AddGrantConstraint, but MERGES into the single column constraint for
+	// (role, table_ref): a later column GRANT WIDENS the allow-list (PG-faithful) rather
+	// than appending a second entry that would AND-narrow to the intersection. Window-only
+	// constraints (empty columns) are left untouched — only the column dimension merges.
+	// `columns` is lowercased by the caller. Enforced by EnforceBoundConstraints (columns
+	// allow-list) exactly like a pushed constraint — no new enforcement path.
+	void GrantConstraintLive(const std::string &role, const std::string &table_ref,
+	                         const std::vector<std::string> &columns);
+	// Inverse of GrantConstraintLive: drop every COLUMN constraint (non-empty columns) for
+	// (role, table_ref). Window-only constraints are preserved. Paired with a base-cap
+	// RevokeLive so REVOKE-with-columns removes both the grant AND the restriction (over-
+	// revoke = under-grant = fail-safe; a lone constraint-drop would fail OPEN and is never
+	// emitted).
+	void RevokeConstraintLive(const std::string &role, const std::string &table_ref);
 	// birdshot's FIRST grant-removal primitive: erases every live grant on `role` whose
 	// (resource_ref, cap, kind) EXACTLY matches — the inverse of one GrantLive. Exact-ref
 	// (not RefMatch) so a REVOKE undoes precisely the grant a prior GRANT added.

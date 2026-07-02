@@ -1745,6 +1745,14 @@ SELECT birdshot_add_service_token('collide-tok', 'collide');
 ----
 ok
 
+# A subject with NO explicit roles/grants ("norole"), for the PUBLIC test: a GRANT
+# TO PUBLIC must reach it even though it holds nothing. Committed here for the same
+# reason (later PUBLIC grants are direct-to-live).
+query I
+SELECT birdshot_add_service_token('norole-tok', 'norole');
+----
+ok
+
 query I
 SELECT birdshot_commit_config();
 ----
@@ -1893,23 +1901,30 @@ GRANT SELCT ON main.gtab TO grantee1;
 ----
 unknown or unenforced privilege
 
-# Column list is deferred -> clear error.
+# Empty column list -> clear error (never a silent drop).
 statement error
-GRANT SELECT (id) ON main.gtab TO grantee1;
+GRANT SELECT () ON main.gtab TO grantee1;
 ----
-column lists are not supported
+empty column list
 
-# WITH GRANT OPTION is deferred -> clear error.
+# CURRENT_USER is an HONEST BLOCKER on this path (no caller identity available);
+# the error states the reason (not a generic "unsupported").
 statement error
-GRANT SELECT ON main.gtab TO grantee1 WITH GRANT OPTION;
+GRANT SELECT ON main.gtab TO CURRENT_USER;
 ----
-WITH GRANT
+needs a caller identity
 
-# PUBLIC grantee is deferred -> clear error.
+# REVOKE GRANT OPTION FOR needs the Phase 3b delegation graph -> clear error.
 statement error
-GRANT SELECT ON main.gtab TO PUBLIC;
+REVOKE GRANT OPTION FOR SELECT ON main.gtab FROM grantee1;
 ----
-PUBLIC
+not supported yet
+
+# A column list on a non-relation object is rejected.
+statement error
+GRANT USAGE (x) ON SEQUENCE main.gseq TO grantee1;
+----
+column lists apply only to TABLE/VIEW
 
 # Malformed (no grantee) -> error.
 statement error
@@ -1974,5 +1989,253 @@ true
 # (Pre-fix this returned true = escalation.)
 query I
 SELECT birdshot_authorize('csess', 'SELECT * FROM main.gsensitive');
+----
+false
+
+# ==========================================================================
+# Native GRANT / REVOKE — Phase 3a deferred constructs, now BUILT
+# ==========================================================================
+
+# ---- Tier 1: COLUMN LISTS (GrantConstraint allow-list) ----------------------
+# `GRANT SELECT (c1,c2) ON t` = a read grant on t PLUS a column allow-list {c1,c2}
+# enforced by the SAME EnforceBoundConstraints path a pushed constraint uses.
+
+statement ok
+CREATE TABLE main.gcol(id INT, title VARCHAR, secret VARCHAR);
+
+query I
+GRANT SELECT (id, title) ON main.gcol TO grantee1;
+----
+GRANT
+
+# Allowed columns -> allow.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT id, title FROM main.gcol');
+----
+true
+
+# A non-allowed column -> deny (secret is outside the allow-list).
+query I
+SELECT birdshot_authorize('gsess', 'SELECT secret FROM main.gcol');
+----
+false
+
+# A star pulls in secret -> deny.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gcol');
+----
+false
+
+# REVOKE with the column list removes BOTH the base grant and the constraint.
+query I
+REVOKE SELECT (id, title) ON main.gcol FROM grantee1;
+----
+REVOKE
+
+# Grant gone -> even an allowed column now denies (no base read grant).
+query I
+SELECT birdshot_authorize('gsess', 'SELECT id FROM main.gcol');
+----
+false
+
+# ---- Tier 1: column lists on WRITES (UPDATE target columns) ------------------
+# INSERT/UPDATE target columns are charged into read_cols by the bind-walk, so the
+# same allow-list restricts which columns a write may touch.
+
+query I
+GRANT SELECT ON main.gcol TO grantee1;
+----
+GRANT
+
+query I
+GRANT UPDATE (title) ON main.gcol TO grantee1;
+----
+GRANT
+
+# UPDATE of an allowed column -> allow.
+query I
+SELECT birdshot_authorize('gsess', 'UPDATE main.gcol SET title = ''x''');
+----
+true
+
+# UPDATE of a non-allowed column -> deny (secret outside the allow-list).
+query I
+SELECT birdshot_authorize('gsess', 'UPDATE main.gcol SET secret = ''x''');
+----
+false
+
+# ---- Tier 2: ALL TABLES IN SCHEMA -> wildcard <schema>.* --------------------
+
+statement ok
+CREATE SCHEMA gtsch;
+
+statement ok
+CREATE TABLE gtsch.ta(a INT);
+
+statement ok
+CREATE TABLE gtsch.tb(b INT);
+
+query I
+GRANT SELECT ON ALL TABLES IN SCHEMA gtsch TO grantee1;
+----
+GRANT
+
+# The one wildcard grant covers EVERY table in the schema.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM gtsch.ta');
+----
+true
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM gtsch.tb');
+----
+true
+
+# The wildcard is catalog-AGNOSTIC by design (`*.gtsch.*`): it matches an EXPLICITLY
+# catalog-qualified ref too, via the schema segment. (A plain control-plane `gtsch.*`
+# push stays catalog-SENSITIVE and would NOT match this — see RefMatch; that asymmetry
+# preserves the compiler's fail-closed cold-cache invariant.)
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM memory.gtsch.ta');
+----
+true
+
+# A table in a DIFFERENT schema, with NO grant at all, is not covered by gtsch.* ->
+# deny. (Unmasked negative: gnope has no grant/constraint, so this deny can ONLY be
+# "gtsch.* did not match" — it would fail if the wildcard ever over-matched.)
+statement ok
+CREATE TABLE main.gnope(x INT);
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gnope');
+----
+false
+
+# ---- Tier 3: PUBLIC reaches every identity (incl. a role-less user) ----------
+
+statement ok
+CREATE TABLE main.gpub(id INT);
+
+# Authenticate "norole" — a subject with NO roles/grants at all.
+query I
+SELECT birdshot_authenticate('nrsess', 'norole-tok', '');
+----
+true
+
+# Before the PUBLIC grant: default-deny for the role-less user.
+query I
+SELECT birdshot_authorize('nrsess', 'SELECT * FROM main.gpub');
+----
+false
+
+query I
+GRANT SELECT ON main.gpub TO PUBLIC;
+----
+GRANT
+
+# PUBLIC reaches the role-less user (the enforcement-hot-path merge).
+query I
+SELECT birdshot_authorize('nrsess', 'SELECT * FROM main.gpub');
+----
+true
+
+# …and a user WITH roles too.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gpub');
+----
+true
+
+# Revoking PUBLIC removes it for EVERYONE.
+query I
+REVOKE SELECT ON main.gpub FROM PUBLIC;
+----
+REVOKE
+
+query I
+SELECT birdshot_authorize('nrsess', 'SELECT * FROM main.gpub');
+----
+false
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gpub');
+----
+false
+
+# ---- Tier 4: WITH GRANT OPTION / GRANTED BY (stored, accepted, no error) -----
+
+statement ok
+CREATE TABLE main.gwgo(id INT);
+
+# WITH GRANT OPTION parses + stores; the grant itself still takes effect.
+query I
+GRANT SELECT ON main.gwgo TO grantee1 WITH GRANT OPTION;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gwgo');
+----
+true
+
+# GRANTED BY parses + stores; grant takes effect.
+query I
+GRANT SELECT ON main.gwgo TO grantee1 GRANTED BY someadmin;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gwgo');
+----
+true
+
+# ---- Tier 5: CASCADE / RESTRICT on REVOKE (accepted; plain scoped revoke) ----
+
+statement ok
+CREATE TABLE main.gcasc(id INT);
+
+query I
+GRANT SELECT ON main.gcasc TO grantee1;
+----
+GRANT
+
+query I
+REVOKE SELECT ON main.gcasc FROM grantee1 CASCADE;
+----
+REVOKE
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gcasc');
+----
+false
+
+query I
+GRANT SELECT ON main.gcasc TO grantee1;
+----
+GRANT
+
+query I
+REVOKE SELECT ON main.gcasc FROM grantee1 RESTRICT;
+----
+REVOKE
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM main.gcasc');
+----
+false
+
+# ---- WIRE-DENY holds for a COLUMN-LIST GRANT (mandatory security re-check) ---
+# A wire-submitted column-list GRANT is denied fail-closed AND is ineffective.
+
+statement ok
+CREATE TABLE main.gwire(id INT, title VARCHAR);
+
+query I
+SELECT birdshot_authorize('gsess', 'GRANT SELECT (id) ON main.gwire TO grantee1');
+----
+false
+
+# …and it did not take effect: the subsequent SELECT is still denied.
+query I
+SELECT birdshot_authorize('gsess', 'SELECT id FROM main.gwire');
 ----
 false

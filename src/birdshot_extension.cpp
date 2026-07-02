@@ -199,7 +199,7 @@ void State::Commit() {
 // These write live_ directly (no staging) so a GRANT takes effect on the next
 // authorize. Reachable ONLY from the trusted-path GRANT/REVOKE table function.
 void State::GrantLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
-                      const std::string &kind_str) {
+                      const std::string &kind_str, bool grant_option, const std::string &grantor) {
 	Capability cap;
 	if (!ParseCapability(cap_str, cap))
 		return; // unknown capability -> fail-closed no-op (never over-grant)
@@ -211,7 +211,55 @@ void State::GrantLive(const std::string &role, const std::string &resource_ref, 
 	g.resource_ref = LowerCopy(resource_ref);
 	g.cap = cap;
 	g.kind = kind;
+	g.grant_option = grant_option; // stored, inert until Phase 3b (never affects Covers)
+	g.grantor = grantor;           // stored, inert until cascade REVOKE (Phase 3b)
 	live_.role_grants[role].push_back(g);
+}
+// Column-list GRANT: merge `columns` into the single existing column constraint for
+// (role, table_ref), or create one. WIDENING semantics (PG-faithful) + exactly one
+// column entry per (role,ref) avoids the AND-narrowing that appending a second entry
+// would cause (each constraint is table-scoped and ANDed in EnforceBoundConstraints).
+void State::GrantConstraintLive(const std::string &role, const std::string &table_ref,
+                                const std::vector<std::string> &columns) {
+	std::string ref = LowerCopy(table_ref);
+	std::lock_guard<std::mutex> lk(mtx_);
+	auto &vec = live_.role_constraints[role];
+	// Find an existing COLUMN constraint (non-empty columns) for this exact ref to widen.
+	for (auto &c : vec) {
+		if (c.table_ref == ref && !c.columns.empty()) {
+			for (const auto &col : columns) {
+				bool present = false;
+				for (const auto &e : c.columns)
+					if (e == col) {
+						present = true;
+						break;
+					}
+				if (!present)
+					c.columns.push_back(col);
+			}
+			return;
+		}
+	}
+	// None yet: add a fresh column constraint (windows unset; window-only entries untouched).
+	GrantConstraint c;
+	c.table_ref = ref;
+	c.columns = columns;
+	c.window_start_min = -1;
+	c.window_end_min = -1;
+	vec.push_back(c);
+}
+// Inverse: erase every COLUMN constraint (non-empty columns) for (role, table_ref).
+// Window-only constraints are preserved.
+void State::RevokeConstraintLive(const std::string &role, const std::string &table_ref) {
+	std::string ref = LowerCopy(table_ref);
+	std::lock_guard<std::mutex> lk(mtx_);
+	auto it = live_.role_constraints.find(role);
+	if (it == live_.role_constraints.end())
+		return;
+	auto &v = it->second;
+	v.erase(std::remove_if(v.begin(), v.end(),
+	                       [&](const GrantConstraint &c) { return c.table_ref == ref && !c.columns.empty(); }),
+	        v.end());
 }
 void State::RevokeLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
                        const std::string &kind_str) {
@@ -303,26 +351,36 @@ std::vector<Grant> State::GrantsForUser(const std::string &user_id) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	std::vector<Grant> out;
 	auto it = live_.user_roles.find(user_id);
-	if (it == live_.user_roles.end())
-		return out;
-	for (const auto &role : it->second) {
-		auto git = live_.role_grants.find(role);
-		if (git != live_.role_grants.end())
-			out.insert(out.end(), git->second.begin(), git->second.end());
+	if (it != live_.user_roles.end()) {
+		for (const auto &role : it->second) {
+			auto git = live_.role_grants.find(role);
+			if (git != live_.role_grants.end())
+				out.insert(out.end(), git->second.begin(), git->second.end());
+		}
 	}
+	// PUBLIC: grants on the reserved public pseudo-role are held implicitly by EVERY
+	// authenticated identity — INCLUDING a user with no explicit roles, so this merge
+	// runs unconditionally (do NOT early-return above on the no-roles case).
+	auto pit = live_.role_grants.find(PublicRole());
+	if (pit != live_.role_grants.end())
+		out.insert(out.end(), pit->second.begin(), pit->second.end());
 	return out;
 }
 std::vector<GrantConstraint> State::ConstraintsForUser(const std::string &user_id) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	std::vector<GrantConstraint> out;
 	auto it = live_.user_roles.find(user_id);
-	if (it == live_.user_roles.end())
-		return out;
-	for (const auto &role : it->second) {
-		auto cit = live_.role_constraints.find(role);
-		if (cit != live_.role_constraints.end())
-			out.insert(out.end(), cit->second.begin(), cit->second.end());
+	if (it != live_.user_roles.end()) {
+		for (const auto &role : it->second) {
+			auto cit = live_.role_constraints.find(role);
+			if (cit != live_.role_constraints.end())
+				out.insert(out.end(), cit->second.begin(), cit->second.end());
+		}
 	}
+	// PUBLIC constraints apply to every identity too (same merge rule as grants).
+	auto pit = live_.role_constraints.find(PublicRole());
+	if (pit != live_.role_constraints.end())
+		out.insert(out.end(), pit->second.begin(), pit->second.end());
 	return out;
 }
 // Shared logic: collect all ResourcePolicy entries for a user across their roles,
@@ -333,13 +391,17 @@ MergeResourcePoliciesImpl(const PolicySnapshot &snap, const std::string &user_id
                           const std::unordered_map<std::string, std::vector<ResourcePolicy>> &store) {
 	std::vector<ResourcePolicy> out;
 	auto it = snap.user_roles.find(user_id);
-	if (it == snap.user_roles.end())
-		return out;
-	for (const auto &role : it->second) {
-		auto pit = store.find(role);
-		if (pit != store.end())
-			out.insert(out.end(), pit->second.begin(), pit->second.end());
+	if (it != snap.user_roles.end()) {
+		for (const auto &role : it->second) {
+			auto pit = store.find(role);
+			if (pit != store.end())
+				out.insert(out.end(), pit->second.begin(), pit->second.end());
+		}
 	}
+	// PUBLIC: reserved-pseudo-role resource policies apply to every identity (spec §8d).
+	auto pubit = store.find(PublicRole());
+	if (pubit != store.end())
+		out.insert(out.end(), pubit->second.begin(), pubit->second.end());
 	return out;
 }
 
@@ -427,11 +489,49 @@ std::string State::StatusSummary() {
 
 // ============================ grant matching ================================
 
+// Split a dotted ref (`catalog.schema.table`, `schema.table`, or `table`) into its
+// dot-separated segments. Used for segment-aware wildcard matching.
+static std::vector<std::string> SplitRef(const std::string &ref) {
+	std::vector<std::string> out;
+	size_t start = 0;
+	for (size_t i = 0; i <= ref.size(); i++) {
+		if (i == ref.size() || ref[i] == '.') {
+			out.push_back(ref.substr(start, i - start));
+			start = i + 1;
+		}
+	}
+	return out;
+}
+
 static bool RefMatch(const std::string &grant_ref, const std::string &use_ref) {
 	if (grant_ref == "*")
 		return true;
+	// Catalog-agnostic SCHEMA wildcard `*.<schema>.*`. Minted ONLY by the native
+	// `GRANT … ON ALL TABLES IN SCHEMA <s>` statement — NEVER by the control-plane
+	// compiler (which emits 2-part `schema.table`, or expands wildcards into concrete
+	// refs; see apps/control-api/src/lib/policy-compiler.ts). Matches any use ref whose
+	// SCHEMA segment equals <schema>, across EVERY catalog: `*.main.*` matches a bare
+	// `main.gtab` AND catalog-qualified `memory.main.gtab` / `lake.main.gtab`. The schema
+	// segment is always the second-to-last: seg[0] of `schema.table`, seg[1] of
+	// `catalog.schema.table`. This is deliberately distinct from a plain `schema.*` grant,
+	// which stays CATALOG-SENSITIVE (below) so the compiler's fail-closed "literal wildcard
+	// matches nothing at the bind-walk" invariant is preserved.
+	{
+		auto gseg = SplitRef(grant_ref);
+		if (gseg.size() == 3 && gseg[0] == "*" && gseg[2] == "*" && !gseg[1].empty() && gseg[1] != "*") {
+			auto useg = SplitRef(use_ref);
+			return useg.size() >= 2 && useg[useg.size() - 2] == gseg[1];
+		}
+	}
 	if (grant_ref.size() >= 2 && grant_ref.compare(grant_ref.size() - 2, 2, ".*") == 0) {
 		std::string prefix = grant_ref.substr(0, grant_ref.size() - 1); // keep trailing '.'
+		// A plain `.*` wildcard is CATALOG-SENSITIVE: use_ref must START with the prefix.
+		// `lake.*` matches `lake.sales.orders`; `main.*` matches a BARE `main.gtab` but NOT a
+		// catalog-qualified `lake.main.gtab`. The control-plane compiler RELIES on this — it
+		// EXPANDS schema wildcards into concrete `schema.table` refs precisely because a bare
+		// `schema.*` must not reach lake-qualified bound refs (so a cold-cache literal wildcard
+		// fails CLOSED, not open). The cross-catalog schema wildcard is spelled `*.<schema>.*`
+		// and handled above — never confuse the two.
 		return use_ref.rfind(prefix, 0) == 0;
 	}
 	if (grant_ref == use_ref)
@@ -1233,24 +1333,32 @@ static void StatusFn(DataChunk &args, ExpressionState &state, Vector &result) {
 // privileged connection, which does NOT self-authorize) actually executes it.
 //
 // Grammar supported (curated subset of PostgreSQL, spec §5/§8):
-//   GRANT  <privlist|ALL [PRIVILEGES]> ON [<objkind>] <ref> TO   <grantee>[, …]
-//   REVOKE <privlist|ALL [PRIVILEGES]> ON [<objkind>] <ref> FROM <grantee>[, …]
-//   GRANT  <rolename> TO   <grantee>[, …]     (role membership — no ON)
+//   GRANT  <priv[(cols)][,…]|ALL [PRIVILEGES]> ON <object> TO   <grantee>[, …] [WITH … OPTION] [GRANTED BY r]
+//   REVOKE <priv[(cols)][,…]|ALL [PRIVILEGES]> ON <object> FROM <grantee>[, …] [GRANTED BY r] [CASCADE|RESTRICT]
+//   GRANT  <rolename> TO   <grantee>[, …] [WITH ADMIN OPTION]   (role membership — no ON)
 //   REVOKE <rolename> FROM <grantee>[, …]
-// privileges  -> SELECT/INSERT/UPDATE/DELETE/TRUNCATE/CREATE/DROP/ALTER/USAGE/EXECUTE
-// <objkind>   -> optional TABLE/VIEW/SEQUENCE/FUNCTION/TYPE/SCHEMA/DATABASE (default TABLE)
-// <grantee>   -> a bare identifier (a subject) or `ROLE <name>`
-// FAIL-CLOSED: an unknown/unenforced privilege (TRIGGER/REFERENCES/…), or any
+// privileges  -> SELECT/INSERT/UPDATE/DELETE/TRUNCATE/CREATE/DROP/ALTER/USAGE/EXECUTE, each with an
+//                optional per-privilege column list `(c1,c2)` (Tier 1; TABLE/VIEW only).
+// <object>    -> [<objkind>] <ref>   (objkind = TABLE/VIEW/SEQUENCE/FUNCTION/TYPE/SCHEMA/DATABASE, default TABLE)
+//                | ALL <TABLES|VIEWS|SEQUENCES|FUNCTIONS|TYPES> IN SCHEMA <schema>   -> wildcard ref <schema>.*
+// <grantee>   -> a bare identifier (a subject), `ROLE <name>`, or PUBLIC (reserved pseudo-role).
+// WITH GRANT OPTION / GRANTED BY <r> are STORED on the grant (inert until Phase 3b delegation).
+// CASCADE/RESTRICT are ACCEPTED and applied as the plain scoped revoke (no dependency graph yet).
+// FAIL-CLOSED: an unknown/unenforced privilege (TRIGGER/REFERENCES/…), an empty `()`, or any
 // malformed input, returns a DISPLAY_EXTENSION_ERROR — never a silent drop.
-// DEFERRED (clear error): column lists `(c,…)`, ALL … IN SCHEMA, PUBLIC, CURRENT_USER,
-// GRANTED BY, WITH GRANT OPTION, CASCADE/RESTRICT.
+// HONEST BLOCKER (clear error): CURRENT_USER/CURRENT_ROLE/SESSION_USER (no caller identity on
+// this path); REVOKE GRANT OPTION FOR (needs the Phase 3b grant graph).
 
-// One resolved store mutation, serialized into a single tab-delimited line. Codes:
-//   g\t<role>\t<is_subject 0/1>\t<ref>\t<kind>\t<cap>   grant a privilege
-//   r\t<role>\t<is_subject 0/1>\t<ref>\t<kind>\t<cap>   revoke a privilege
-//   gr\t<subject>\t<role>                               grant role membership
-//   rr\t<subject>\t<role>                               revoke role membership
-// Identifiers come from a whitespace/comma tokenizer, so they never contain \t or \n.
+// One resolved store mutation, serialized into a single tab-delimited line. <flag> is the
+// grantee kind: "1"=subject (namespaced self-role), "0"=named role, "p"=PUBLIC pseudo-role. Codes:
+//   g\t<name>\t<flag>\t<ref>\t<kind>\t<cap>\t<grant_option 0/1>\t<grantor>   grant a privilege
+//   r\t<name>\t<flag>\t<ref>\t<kind>\t<cap>                                 revoke a privilege
+//   gc\t<name>\t<flag>\t<ref>\t<col1,col2,…>                                install/widen a column allow-list
+//   rc\t<name>\t<flag>\t<ref>                                              drop the column allow-list
+//   gr\t<subject>\t<role>                                                  grant role membership
+//   rr\t<subject>\t<role>                                                  revoke role membership
+// Identifiers come from a whitespace/comma tokenizer, so they never contain \t or \n. Column
+// names are lowercased and comma-joined into one field (no \t), split back in the applier.
 
 static std::string GrantLower(const std::string &s) {
 	std::string o = s;
@@ -1338,28 +1446,48 @@ struct BirdshotGrantParseData : public ParserExtensionParseData {
 	}
 };
 
-// A grantee: a bare subject id, or a named role (`ROLE r`).
+// A grantee: a bare subject id, a named role (`ROLE r`), or the reserved PUBLIC
+// pseudo-role (every authenticated identity, spec §8d).
 struct GrantGrantee {
 	std::string name;
-	bool is_subject;
+	bool is_subject = false;
+	bool is_public = false;
 };
 
-// Parse a grantee list (comma-separated `<ident>` or `ROLE <ident>`). Returns false
-// (caller rejects) on any malformed segment or an empty list.
-static bool GrantParseGrantees(const vector<std::string> &toks, size_t begin, vector<GrantGrantee> &out) {
+// Serialized grantee flag: "1"=subject (namespaced self-role), "0"=named role,
+// "p"=PUBLIC (reserved pseudo-role). Decoded symmetrically in BirdshotApplyGrantOps.
+static const char *GranteeFlag(const GrantGrantee &g) {
+	if (g.is_public)
+		return "p";
+	return g.is_subject ? "1" : "0";
+}
+
+// Parse a grantee list (comma-separated `<ident>` | `ROLE <ident>` | `PUBLIC`), over
+// toks[begin, end). Returns false (caller rejects) on any malformed segment or empty list.
+static bool GrantParseGrantees(const vector<std::string> &toks, size_t begin, size_t end,
+                               vector<GrantGrantee> &out) {
 	vector<std::string> seg;
 	auto emit = [&]() -> bool {
-		if (seg.size() == 1) {
-			out.push_back(GrantGrantee {seg[0], true});
+		if (seg.size() == 1 && GrantLower(seg[0]) == "public") {
+			GrantGrantee g;
+			g.is_public = true;
+			out.push_back(g);
+		} else if (seg.size() == 1) {
+			GrantGrantee g;
+			g.name = seg[0];
+			g.is_subject = true;
+			out.push_back(g);
 		} else if (seg.size() == 2 && GrantLower(seg[0]) == "role") {
-			out.push_back(GrantGrantee {seg[1], false});
+			GrantGrantee g;
+			g.name = seg[1];
+			out.push_back(g);
 		} else {
 			return false;
 		}
 		seg.clear();
 		return true;
 	};
-	for (size_t i = begin; i < toks.size(); i++) {
+	for (size_t i = begin; i < end && i < toks.size(); i++) {
 		if (toks[i] == ",") {
 			if (!emit())
 				return false;
@@ -1370,6 +1498,16 @@ static bool GrantParseGrantees(const vector<std::string> &toks, size_t begin, ve
 	if (!seg.empty() && !emit())
 		return false;
 	return !out.empty();
+}
+
+// Map a plural object-class (in `ALL <plural> IN SCHEMA s`) to its singular ObjKind spelling.
+static bool GrantPluralKind(const std::string &plural, std::string &singular_out) {
+	if (plural == "tables")    { singular_out = "table";    return true; }
+	if (plural == "views")     { singular_out = "view";     return true; }
+	if (plural == "sequences") { singular_out = "sequence"; return true; }
+	if (plural == "functions") { singular_out = "function"; return true; }
+	if (plural == "types")     { singular_out = "type";     return true; }
+	return false;
 }
 
 static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, const string &query) {
@@ -1384,50 +1522,132 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 	// From here it IS ours: every failure is a DISPLAY_EXTENSION_ERROR (fail-closed).
 	auto err = [](const std::string &m) { return ParserExtensionParseResult("birdshot GRANT: " + m); };
 
-	// Reject deferred / unsupported constructs up front (clear error, never a silent drop).
-	for (const auto &tk : toks) {
-		if (tk == "(" || tk == ")")
-			return err("column lists are not supported yet");
-		std::string l = GrantLower(tk);
-		if (l == "public")
-			return err("PUBLIC grantee is not supported yet");
-		if (l == "current_user" || l == "current_role" || l == "session_user")
-			return err("CURRENT_USER/CURRENT_ROLE grantee is not supported yet");
-		if (l == "with")
-			return err("WITH GRANT/ADMIN OPTION is not supported yet");
-		if (l == "granted")
-			return err("GRANTED BY is not supported yet");
-		if (l == "cascade" || l == "restrict")
-			return err("CASCADE/RESTRICT is not supported yet");
-		if (l == "in")
-			return err("ALL … IN SCHEMA is not supported yet");
+	// Precompute lowercased tokens for keyword tests (identifiers stay case-preserved in toks).
+	vector<std::string> low(toks.size());
+	for (size_t i = 0; i < toks.size(); i++)
+		low[i] = GrantLower(toks[i]);
+
+	// HONEST BLOCKER (spec "honest exception"): CURRENT_USER / CURRENT_ROLE / SESSION_USER
+	// resolve to the identity RUNNING the GRANT. The trusted authoring path (gateway
+	// privileged connection / bare CLI) has NO birdshot session identity in the table-
+	// function ClientContext (birdshot's identity map is keyed by the quack session id,
+	// unavailable here), so these are genuinely unresolvable on this path. Clear error
+	// stating the reason — never a faked resolution.
+	for (size_t i = 0; i < toks.size(); i++) {
+		if (low[i] == "current_user" || low[i] == "current_role" || low[i] == "session_user")
+			return err(low[i] + " needs a caller identity, available only once wire-authorized "
+			                    "GRANT lands in Phase 3b");
 	}
 
+	// REVOKE GRANT OPTION FOR … strips only the delegation right — a grant-graph feature
+	// that lands with Phase 3b. Deferred with a clear error (never silent).
+	if (is_revoke && low.size() >= 4 && low[1] == "grant" && low[2] == "option" && low[3] == "for")
+		return err("REVOKE GRANT OPTION FOR is not supported yet (Phase 3b delegation graph)");
+
 	const std::string kw = is_grant ? "to" : "from"; // GRANT … TO … / REVOKE … FROM …
-	int on_idx = -1, kw_idx = -1;
+	// Locate ON and TO/FROM at PAREN DEPTH 0 so a column list `(c1,c2)` (its commas, and
+	// pathologically an identifier spelled like a keyword) can't be mistaken for structure.
+	int on_idx = -1, kw_idx = -1, depth = 0;
 	for (size_t i = 1; i < toks.size(); i++) {
-		std::string l = GrantLower(toks[i]);
-		if (l == "on" && on_idx < 0)
+		if (toks[i] == "(") {
+			depth++;
+			continue;
+		}
+		if (toks[i] == ")") {
+			if (depth > 0)
+				depth--;
+			continue;
+		}
+		if (depth != 0)
+			continue;
+		if (low[i] == "on" && on_idx < 0)
 			on_idx = static_cast<int>(i);
-		if (l == kw && kw_idx < 0)
+		if (low[i] == kw && kw_idx < 0)
 			kw_idx = static_cast<int>(i);
 	}
 	if (kw_idx < 0)
 		return err(std::string("expected ") + (is_grant ? "TO" : "FROM"));
+
+	// Trailing clauses after the grantee list: WITH … OPTION / GRANTED BY / CASCADE|RESTRICT.
+	int tail_idx = -1;
+	depth = 0;
+	for (size_t i = static_cast<size_t>(kw_idx) + 1; i < toks.size(); i++) {
+		if (toks[i] == "(") {
+			depth++;
+			continue;
+		}
+		if (toks[i] == ")") {
+			if (depth > 0)
+				depth--;
+			continue;
+		}
+		if (depth != 0)
+			continue;
+		if (low[i] == "with" || low[i] == "granted" || low[i] == "cascade" || low[i] == "restrict") {
+			tail_idx = static_cast<int>(i);
+			break;
+		}
+	}
+	size_t grantee_end = tail_idx < 0 ? toks.size() : static_cast<size_t>(tail_idx);
+
+	// Parse the trailing clauses -> grant_option + grantor. CASCADE/RESTRICT are ACCEPTED
+	// and applied as the ordinary scoped revoke: without a delegation dependency graph
+	// (Phase 3b) RESTRICT is already the effective default (no tracked dependents to block)
+	// and CASCADE reduces to the plain revoke. True cascade lands with the Phase 3b grant graph.
+	bool grant_option = false;
+	std::string grantor;
+	if (tail_idx >= 0) {
+		size_t i = static_cast<size_t>(tail_idx);
+		while (i < toks.size()) {
+			if (low[i] == "with") {
+				// WITH GRANT OPTION (privilege) / WITH ADMIN OPTION (role membership).
+				if (i + 2 < toks.size() && low[i + 2] == "option" && (low[i + 1] == "grant" || low[i + 1] == "admin")) {
+					grant_option = true;
+					i += 3;
+					continue;
+				}
+				return err("malformed WITH … OPTION clause");
+			} else if (low[i] == "granted") {
+				if (i + 1 >= toks.size() || low[i + 1] != "by")
+					return err("expected BY after GRANTED");
+				size_t j = i + 2;
+				if (j < toks.size() && low[j] == "role" && j + 1 < toks.size()) {
+					grantor = toks[j + 1];
+					j += 2;
+				} else if (j < toks.size()) {
+					grantor = toks[j];
+					j += 1;
+				} else {
+					return err("GRANTED BY needs a grantor name");
+				}
+				i = j;
+				continue;
+			} else if (low[i] == "cascade" || low[i] == "restrict") {
+				i += 1;
+				continue;
+			}
+			return err("unexpected token '" + toks[i] + "' in trailing clause");
+		}
+	}
 
 	vector<std::string> ops;
 
 	if (on_idx < 0) {
 		// ---- role membership: GRANT <role> TO <grantees> / REVOKE <role> FROM <grantees> ----
 		if (kw_idx != 2)
-			return err("expected a single role name before " + GrantLower(kw));
+			return err("expected a single role name before " + kw);
 		std::string role = toks[1];
 		vector<GrantGrantee> grantees;
-		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantees))
+		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantee_end, grantees))
 			return err("malformed grantee list");
 		const char *code = is_grant ? "gr" : "rr";
-		for (const auto &g : grantees)
+		for (const auto &g : grantees) {
+			if (g.is_public)
+				return err("PUBLIC is not a valid target for role membership");
+			if (!g.is_subject)
+				return err("role-to-role membership (ROLE …) is not modeled; grant to a subject");
 			ops.push_back(std::string(code) + "\t" + g.name + "\t" + role);
+		}
 	} else {
 		// ---- privilege grant/revoke ----
 		if (on_idx <= 1)
@@ -1435,33 +1655,77 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 		if (kw_idx <= on_idx)
 			return err(std::string("expected ") + (is_grant ? "TO" : "FROM") + " after the object");
 
-		// privileges: toks(1 .. on_idx)
+		// ---- privileges (each with an OPTIONAL column list): toks(1 .. on_idx) ----------
+		// PG attaches a column list per-privilege (`SELECT (c1,c2)`). birdshot column allow-
+		// lists are TABLE-scoped (not per-cap), so ALL column lists in one statement are
+		// UNIONed into a single constraint (spec §8a; EnforceBoundConstraints). Consequence
+		// (documented): a statement mixing a restricted priv with an unrestricted one on the
+		// same table applies the union restriction to BOTH — over-restrict = under-grant = safe.
 		bool all_mode = false;
 		vector<std::string> caps;
-		vector<std::string> priv_toks;
-		for (int i = 1; i < on_idx; i++) {
-			if (toks[i] == ",")
-				continue;
-			priv_toks.push_back(GrantLower(toks[i]));
-		}
-		if (priv_toks.empty())
-			return err("expected a privilege list");
-		if (priv_toks[0] == "all") {
-			all_mode = true;
-			if (priv_toks.size() == 2 && priv_toks[1] != "privileges")
-				return err("unexpected token after ALL");
-			if (priv_toks.size() > 2)
-				return err("unexpected tokens after ALL PRIVILEGES");
-		} else {
-			for (const auto &p : priv_toks) {
+		std::vector<std::string> col_union;
+		{
+			bool first = true;
+			int i = 1;
+			while (i < on_idx) {
+				if (toks[i] == ",") {
+					i++;
+					continue;
+				}
+				if (first && low[i] == "all") {
+					all_mode = true;
+					int j = i + 1;
+					if (j < on_idx && low[j] == "privileges")
+						j++;
+					for (int k = j; k < on_idx; k++)
+						if (toks[k] != ",")
+							return err("unexpected token after ALL PRIVILEGES");
+					break;
+				}
+				first = false;
 				std::string cap;
-				if (!GrantPrivToCap(p, cap))
-					return err("unknown or unenforced privilege '" + p + "'");
+				if (!GrantPrivToCap(low[i], cap))
+					return err("unknown or unenforced privilege '" + low[i] + "'");
 				caps.push_back(cap);
+				// optional column list immediately after this privilege
+				if (i + 1 < on_idx && toks[i + 1] == "(") {
+					int j = i + 2;
+					bool any = false;
+					while (j < on_idx && toks[j] != ")") {
+						if (toks[j] == ",") {
+							j++;
+							continue;
+						}
+						if (toks[j] == "(")
+							return err("nested parentheses in column list");
+						std::string col = GrantLower(toks[j]);
+						bool present = false;
+						for (const auto &e : col_union)
+							if (e == col) {
+								present = true;
+								break;
+							}
+						if (!present)
+							col_union.push_back(col);
+						any = true;
+						j++;
+					}
+					if (j >= on_idx || toks[j] != ")")
+						return err("unterminated column list");
+					if (!any)
+						return err("empty column list '()'");
+					i = j + 1;
+					continue;
+				}
+				i++;
 			}
 		}
+		if (!all_mode && caps.empty())
+			return err("expected a privilege list");
 
-		// object: toks(on_idx+1 .. kw_idx) = [<objkind>] <ref>
+		// ---- object: toks(on_idx+1 .. kw_idx) --------------------------------------------
+		//   [<objkind>] <ref>                              a named object
+		//   ALL <TABLES|VIEWS|SEQUENCES|FUNCTIONS|TYPES> IN SCHEMA <schema>   -> wildcard <schema>.*
 		vector<std::string> obj_toks;
 		for (int i = on_idx + 1; i < kw_idx; i++) {
 			if (toks[i] == ",")
@@ -1470,7 +1734,17 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 		}
 		std::string kind = "table";
 		std::string ref;
-		if (obj_toks.size() == 1) {
+		if (!obj_toks.empty() && GrantLower(obj_toks[0]) == "all") {
+			if (obj_toks.size() != 5 || GrantLower(obj_toks[2]) != "in" || GrantLower(obj_toks[3]) != "schema")
+				return err("expected ALL <TABLES|VIEWS|SEQUENCES|FUNCTIONS|TYPES> IN SCHEMA <schema>");
+			if (!GrantPluralKind(GrantLower(obj_toks[1]), kind))
+				return err("unknown object class '" + GrantLower(obj_toks[1]) + "' after ALL");
+			// Catalog-agnostic schema wildcard `*.<schema>.*` (see RefMatch): matches every
+			// object in schema <s> across every catalog (bare or catalog-qualified use refs).
+			// Deliberately DISTINCT from a plain `<s>.*` — which the control-plane compiler
+			// emits with catalog-SENSITIVE semantics — so the two paths can never collide.
+			ref = "*." + GrantLower(obj_toks[4]) + ".*";
+		} else if (obj_toks.size() == 1) {
 			if (GrantIsObjKind(GrantLower(obj_toks[0])))
 				return err("expected an object name after the object kind");
 			ref = obj_toks[0];
@@ -1487,20 +1761,45 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 				return err("ALL PRIVILEGES is not supported for " + kind);
 		}
 
+		// Column lists apply only to relation objects (table/view); the allow-list is a
+		// read/write-column concept with no meaning on a sequence/function/type/schema.
+		if (!col_union.empty() && !(kind == "table" || kind == "view"))
+			return err("column lists apply only to TABLE/VIEW objects");
+
 		vector<GrantGrantee> grantees;
-		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantees))
+		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantee_end, grantees))
 			return err("malformed grantee list");
 
-		// NOTE (spec §1c, documented deferral): SCHEMA/DATABASE refs are stored VERBATIM.
-		// Wildcard domination (`ON SCHEMA s` covering objects in s) is NOT expanded here —
-		// a verbatim schema ref simply fails to RefMatch object uses, so it is inert
-		// (under-grant = fail-safe). Enforced privilege×object combos on named TABLE/VIEW/
-		// SEQUENCE/FUNCTION/TYPE objects are the covered set.
 		const char *code = is_grant ? "g" : "r";
-		for (const auto &g : grantees)
-			for (const auto &cap : caps)
-				ops.push_back(std::string(code) + "\t" + g.name + "\t" + (g.is_subject ? "1" : "0") + "\t" + ref +
-				              "\t" + kind + "\t" + cap);
+		const char *ccode = is_grant ? "gc" : "rc";
+		for (const auto &g : grantees) {
+			std::string flag = GranteeFlag(g);
+			for (const auto &cap : caps) {
+				if (is_grant)
+					ops.push_back(std::string(code) + "\t" + g.name + "\t" + flag + "\t" + ref + "\t" + kind + "\t" +
+					              cap + "\t" + (grant_option ? "1" : "0") + "\t" + grantor);
+				else
+					ops.push_back(std::string(code) + "\t" + g.name + "\t" + flag + "\t" + ref + "\t" + kind + "\t" +
+					              cap);
+			}
+			// Column constraint (Tier 1). GRANT installs/widens the allow-list; REVOKE drops it.
+			// The `rc` is ALWAYS paired with the base-cap `r` above, so REVOKE-with-columns
+			// removes BOTH the grant and the restriction (over-revoke = under-grant = fail-safe;
+			// a lone constraint-drop would fail OPEN and is never emitted).
+			if (!col_union.empty()) {
+				if (is_grant) {
+					std::string cols;
+					for (size_t k = 0; k < col_union.size(); k++) {
+						if (k)
+							cols += ",";
+						cols += col_union[k];
+					}
+					ops.push_back(std::string(ccode) + "\t" + g.name + "\t" + flag + "\t" + ref + "\t" + cols);
+				} else {
+					ops.push_back(std::string(ccode) + "\t" + g.name + "\t" + flag + "\t" + ref);
+				}
+			}
+		}
 	}
 
 	if (ops.empty())
@@ -1548,6 +1847,17 @@ static std::string SubjectSelfRole(const std::string &subject) {
 	return std::string("\x1d") + "subj:" + subject;
 }
 
+// Resolve a serialized grantee (flag, name) to its role_key. "1"=subject -> namespaced
+// self-role (collision-proof); "0"=named role -> the name; "p"=PUBLIC -> the reserved
+// pseudo-role every identity holds. Mirrors GranteeFlag on the parse side.
+static std::string GrantRoleKeyFor(const std::string &flag, const std::string &name) {
+	if (flag == "p")
+		return PublicRole();
+	if (flag == "1")
+		return SubjectSelfRole(name);
+	return name; // "0" -> admin-defined role name
+}
+
 static void BirdshotApplyGrantOps(const std::string &blob) {
 	auto &st = State::Get();
 	vector<std::string> lines;
@@ -1560,20 +1870,31 @@ static void BirdshotApplyGrantOps(const std::string &blob) {
 		if (f.empty())
 			continue;
 		const std::string &code = f[0];
-		if (code == "g" && f.size() == 6) {
-			const std::string &name = f[1];
-			bool is_subject = (f[2] == "1");
-			// A subject grantee is stored under its NAMESPACED self-role (never the raw
-			// subject id) so it can't collide with an admin role name. REVOKE below uses the
-			// same mapping, so GRANT/REVOKE stay symmetric.
-			std::string role_key = is_subject ? SubjectSelfRole(name) : name;
-			if (is_subject)
-				st.GrantRoleLive(name, role_key); // attach the subject to its namespaced self-role
-			st.GrantLive(role_key, f[3], f[5], f[4]);
+		// g\t<name>\t<flag>\t<ref>\t<kind>\t<cap>\t<grant_option 0/1>\t<grantor>  (8 fields)
+		if (code == "g" && f.size() == 8) {
+			const std::string &flag = f[2];
+			std::string role_key = GrantRoleKeyFor(flag, f[1]);
+			if (flag == "1")
+				st.GrantRoleLive(f[1], role_key); // attach the subject to its namespaced self-role
+			st.GrantLive(role_key, f[3], f[5], f[4], f[6] == "1", f[7]);
+			// r\t<name>\t<flag>\t<ref>\t<kind>\t<cap>  (6 fields)
 		} else if (code == "r" && f.size() == 6) {
-			bool is_subject = (f[2] == "1");
-			std::string role_key = is_subject ? SubjectSelfRole(f[1]) : f[1];
+			std::string role_key = GrantRoleKeyFor(f[2], f[1]);
 			st.RevokeLive(role_key, f[3], f[5], f[4]);
+			// gc\t<name>\t<flag>\t<ref>\t<cols_csv>  (5 fields) — column-list constraint (install/widen)
+		} else if (code == "gc" && f.size() == 5) {
+			const std::string &flag = f[2];
+			std::string role_key = GrantRoleKeyFor(flag, f[1]);
+			if (flag == "1")
+				st.GrantRoleLive(f[1], role_key); // ensure subject membership even on a constraint-only op
+			vector<std::string> cols;
+			GrantSplit(f[4], ',', cols);
+			st.GrantConstraintLive(role_key, f[3], cols);
+			// rc\t<name>\t<flag>\t<ref>  (4 fields) — drop the column-list constraint
+		} else if (code == "rc" && f.size() == 4) {
+			std::string role_key = GrantRoleKeyFor(f[2], f[1]);
+			st.RevokeConstraintLive(role_key, f[3]);
+			// gr/rr\t<subject>\t<role>  (3 fields) — role membership
 		} else if (code == "gr" && f.size() == 3) {
 			st.GrantRoleLive(f[1], f[2]);
 		} else if (code == "rr" && f.size() == 3) {
