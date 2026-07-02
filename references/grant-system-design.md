@@ -511,6 +511,102 @@ wire-authorized admin grants, cascade) remains Phase 3b; every wire GRANT is den
   verified; wire-enforced security pending an e2e case. The `bind`-purity invariant is what protects the
   wire path structurally in the meantime.
 
+## 12. Grant store = raw GRANT SQL, lazy-hydrated, freshness-validated (2026-07-02, user-directed)
+
+**User decisions (locked):** (1) agent grants are **raw GRANT SQL strings stored in a table birdshot
+reads** — the table *is* the authority for roles/grants; (2) **lazy-pull** a token's grant strings from
+the store the first time birdshot sees that token ("pull the correct grant strings for a token we
+haven't seen yet"); (3) **validate freshness against the main DB on every authorization** — "check if
+the grant has been changed; token roles must be valid and up to date"; (4) **drop time-of-day windows**
+from birdshot enforcement. The control plane "only cares about grant SQL." This supersedes the scalar
+`birdshot_add_role_grant` push for agent grants and builds on the §0 pluggable/protected store.
+
+Design lens (user, verbatim): *"it's not about 'does anything do X' it's 'does X cause a bad state'."*
+Each subsection below names the bad state it prevents.
+
+### 12a. Storage form — raw GRANT SQL keyed by grantee  (bad state: subject collision / cross-lang drift)
+Store table `__birdshot_grants` (protected — §0, §10). Cross-language contract (TS writer ⇄ C++ reader,
+byte-for-byte):
+- `grantee TEXT` — the identity the statement targets, in birdshot's **namespaced** key space: a subject
+  → `SubjectSelfRole(sub)` (`\x1d`+`subj:`+id), an admin role → the bare role name, PUBLIC →
+  `PublicRole()` (`\x1dpublic`). This is the **lazy-pull lookup key**; it MUST be computed identically on
+  both sides or a token silently gets the wrong grants (Finding-A class escalation).
+- `stmt TEXT` — the raw `GRANT …` / `REVOKE …` string.
+- `version BIGINT` (monotonic, bumped on every mutation) — the freshness signal (12d).
+- optional `id`, `revoked_at` for soft-delete + cascade bookkeeping.
+
+Storing SQL (not compiled `Grant` rows) means one parser+applier for both interactive and stored grants,
+and the control plane authors exactly what birdshot enforces.
+
+### 12b. Apply is PARSE-ONLY, never exec  (bad state: arbitrary SQL / DDL from a store row)
+A pulled `stmt` goes through `BirdshotGrantParse` → `BirdshotApplyGrantOps` — the SAME native path as an
+interactive GRANT. birdshot **never** `connection.run(stmt)`. A row that is not a clean GRANT/REVOKE
+(parse error, or any non-grant statement) → the subject is **DENIED** (fail-closed), the row is NOT
+skipped-and-continued. Even though only the control plane can write the store, birdshot treats `stmt` as
+untrusted input: the worst a compromised/buggy row can do is express a well-formed grant — it can never
+run DROP/DELETE/COPY on the agent connection.
+
+### 12c. Lazy hydration fires at ATTACH, not inside authorize  (bad state: re-entrancy / deadlock / hot-path I/O)
+The decisive choice (advisor Crux 1): hydration runs at the **quack ATTACH / `birdshot_authenticate`
+handshake**, on birdshot's **trusted internal store connection**, NOT inside `birdshot_authorize`. A
+store `SELECT` from inside authorize would hit the authorize hook that *protects* the store → deny or
+infinite recursion. "A token we haven't seen" maps naturally to attach-time: pull once → populate
+`State` → authorize stays a pure in-memory read.
+- **Parameterized pull:** `SELECT stmt FROM __birdshot_grants WHERE grantee = ? [AND revoked_at IS NULL]`
+  with a **bound parameter** — the token `sub` is attacker-controlled; never string-concat it. (Fallback
+  if the internal-connection API can't bind against an ATTACHed postgres catalog: strict `sub`
+  charset/length validation. Binding is the goal.)
+- **Transitive role membership:** a pulled `GRANT <role> TO <subj>` adds a role; re-query for that
+  role's `grantee` rows. **Bounded depth + cycle detection** — A∈B, B∈A must fail closed, not hang
+  (availability bad state).
+- **Apply keyed to the grantee NAMED in the stmt, never to the requesting session.** This is what makes
+  a crafted `sub` non-catastrophic: even if it pulled extra rows, each applies to its own parsed
+  grantee, so an attacker only benefits from rows that say `TO <attacker>`. Explicit invariant.
+- **Fail-closed:** store unreachable / query error / any row won't parse → DENY the subject (never
+  proceed on empty-or-partial).
+
+### 12d. Freshness validation against the main DB  (bad state: stale REVOKE fails OPEN)
+Requirement (user): the in-memory `State` is never trusted stale — birdshot validates that grants
+haven't changed and roles are current. For GRANT staleness is harmless (under-grant); **for REVOKE it
+fails OPEN** — the whole reason this is mandatory.
+- **Epoch signal:** the store's monotonic `version` is bumped by the control plane on every mutation.
+  birdshot records the version it hydrated a subject at.
+- **Freshness gate on authorize:** if the store epoch has advanced past the subject's hydrated epoch,
+  re-hydrate that subject before deciding. To keep this off a per-query round-trip, the epoch is read at
+  a **bounded cadence** (cached ≤T, or driven by PG `LISTEN/NOTIFY`), so steady-state authorize stays
+  in-memory and staleness is bounded to T. (Strong per-query validation is available as a high-assurance
+  mode — §7 product decision on the T/round-trip trade-off.)
+- **Instant-deny bridge for REVOKE:** a REVOKE also pushes the affected `(subject[,ref])` onto the
+  existing instant-revocation denylist (checked FIRST in authorize), closing the window immediately and
+  locally before the epoch catches up. This is what makes "up to date" real for revocation.
+- **Token role validity:** role membership is part of the hydrated set and covered by the same epoch;
+  token-level revocation/expiry stays on JWT `exp` + the instant-deny list.
+- **Fail-closed on validation failure:** if the freshness check can't reach the store → DENY (a store
+  outage denies queries — correctness over availability, accepted; a bounded last-known-good grace is a
+  §7 option, default off).
+
+### 12e. Drop windows  (bad state: silently widening a windowed grant to 24/7)
+birdshot stops enforcing time-of-day windows; retire the window params of `birdshot_add_grant_constraint`
+(columns stay — they live in the GRANT SQL and are enforced via the existing `gc`-constraint path).
+**Before removing enforcement, confirm** the compile-time/JWT replacement actually gates time (like row
+limits / `not_before` / `expires_at` already do) OR that no active rule uses a window to *restrict* —
+otherwise a windowed grant silently becomes always-on.
+
+### 12f. Control-plane rewrite — writes SQL, not tuples  (least security-critical; do LAST)
+The control plane writes raw `GRANT`/`REVOKE` SQL rows into `__birdshot_grants` (transactional Postgres
+store) and bumps `version`; it stops pushing `birdshot_add_role_grant` tuples for agent grants. Auth /
+JWKS / lake-catalog setup may remain scalar config. The engine already works standalone without any of
+this, so it is sequenced last.
+
+### 12g. Phasing (advisor-sequenced; do NOT ship as one blob)
+1. **RefMatch catalog-safe wildcards — DONE** (commit `0579dfc`).
+2. **Store-holds-SQL + protection + trusted internal connection.** Prove `__birdshot_grants` and its
+   catalog are unaddressable by any token in BOTH planes before anything reads them.
+3. **Lazy hydration at attach** (12b/12c) — parameterized, parse-only, fail-closed, bounded recursion.
+   Do NOT wire pull into live authorize until protection + parameterization + fail-closed are all in.
+4. **Freshness gate** (12d) — epoch/NOTIFY + instant-deny bridge.
+5. **Control-plane rewrite** (12f) + **drop windows** (12e).
+
 ## Primary sources
 - Capability model / Covers / ParseCapability: `src/birdshot_state.hpp:48-108`
 - Grant / GrantConstraint structs: `src/birdshot_state.hpp:118,128`
