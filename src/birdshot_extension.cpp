@@ -81,7 +81,52 @@ void State::AddRoleGrant(const std::string &role, const std::string &resource_re
 	Grant g;
 	g.resource_ref = LowerCopy(resource_ref);
 	g.cap = cap;
+	g.kind = ObjKind::TABLE; // legacy path: default kind
 	staging_.role_grants[role].push_back(g);
+}
+void State::AddRoleGrantKind(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+                             const std::string &kind_str) {
+	Capability cap;
+	if (!ParseCapability(cap_str, cap))
+		return; // unknown capability -> fail-closed (drop, don't over-grant)
+	ObjKind kind;
+	if (!ParseObjKind(kind_str, kind))
+		return; // unknown object kind -> fail-closed (drop)
+	std::lock_guard<std::mutex> lk(mtx_);
+	Grant g;
+	g.resource_ref = LowerCopy(resource_ref);
+	g.cap = cap;
+	g.kind = kind;
+	staging_.role_grants[role].push_back(g);
+}
+std::string State::SetGrantStore(const std::string &kind, const std::string &target) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	if (kind == "table") {
+		store_kind_ = "table";
+		store_target_ = target;
+		// The store lives in a protected catalog. We use a fixed reserved alias so no
+		// wire token can address it (IsProtectedRef covers `__birdshot`), independent
+		// of whatever the ATTACH target string is.
+		store_catalog_ = "__birdshot";
+		return store_kind_;
+	}
+	// Unknown / "memory" -> memory backend (fail-closed: never half-enable a store).
+	store_kind_ = "memory";
+	store_target_.clear();
+	store_catalog_.clear();
+	return store_kind_;
+}
+std::string State::GrantStoreKind() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return store_kind_;
+}
+std::string State::GrantStoreCatalog() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return store_catalog_;
+}
+bool State::IsProtectedCatalog(const std::string &catalog) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return !store_catalog_.empty() && catalog == store_catalog_;
 }
 void State::AddSourcePolicy(const std::string &role, const std::string &pattern) {
 	std::lock_guard<std::mutex> lk(mtx_);
@@ -347,6 +392,8 @@ static bool UseSatisfied(const TableUse &use, const std::vector<Grant> &grants) 
 	for (const auto &g : grants) {
 		if (!RefMatch(g.resource_ref, use.ref))
 			continue;
+		if (!KindMatch(g.kind, use.kind))
+			continue; // object-kind gate (spec §1c): a table grant never covers a sequence use
 		if (Covers(g.cap, use.cap))
 			return true;
 	}
@@ -572,16 +619,36 @@ static bool EnforceConstraints(const AclAnalysis &a, const std::vector<GrantCons
 
 // ---- bind-and-walk enforcement (primary path) ------------------------------
 
-// Grant check for a bound table use. Mirrors UseSatisfied; BoundTableUse carries
-// the same ref and now a Capability rather than bool write.
-static bool BoundUseSatisfied(const BoundTableUse &use, const std::vector<Grant> &grants) {
-	for (const auto &g : grants) {
-		if (!RefMatch(g.resource_ref, use.ref))
-			continue;
-		if (Covers(g.cap, use.cap))
-			return true;
+// Grant check for a bound table use. A BoundTableUse carries a SET of required caps
+// (spec §1d): EVERY cap must be covered by some grant (ref + kind + capability). If
+// `missing` is non-null it receives the FIRST uncovered cap (for the deny reason).
+// Fails closed on an empty cap set (a real use always has >=1 cap).
+static bool BoundUseSatisfied(const BoundTableUse &use, const std::vector<Grant> &grants,
+                              Capability *missing = nullptr) {
+	if (use.caps.empty()) {
+		if (missing)
+			*missing = Capability::READ;
+		return false; // fail closed: a touched table with no required cap is anomalous
 	}
-	return false;
+	for (Capability need : use.caps) {
+		bool covered = false;
+		for (const auto &g : grants) {
+			if (!RefMatch(g.resource_ref, use.ref))
+				continue;
+			if (!KindMatch(g.kind, use.kind))
+				continue;
+			if (Covers(g.cap, need)) {
+				covered = true;
+				break;
+			}
+		}
+		if (!covered) {
+			if (missing)
+				*missing = need;
+			return false;
+		}
+	}
+	return true;
 }
 
 // Column allow-list + time-window enforcement over the bound analysis. Every
@@ -781,9 +848,10 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 					// fetched above for the bind search-path schemas; reuse it.)
 					bool all_ok = true;
 					for (const auto &use : a.tables) {
-						if (!BoundUseSatisfied(use, grants)) {
+						Capability missing;
+						if (!BoundUseSatisfied(use, grants, &missing)) {
 							all_ok = false;
-							reason = std::string("acl:") + CapabilityName(use.cap) + ":" + use.ref;
+							reason = std::string("acl:") + CapabilityName(missing) + ":" + use.ref;
 							break;
 						}
 					}
@@ -905,6 +973,38 @@ static void AddRoleGrantFn(DataChunk &args, ExpressionState &state, Vector &resu
 		// Legacy callers passing "read" / "write" continue to work unchanged.
 		State::Get().AddRoleGrant(ArgStr(args.data[0], i), ArgStr(args.data[1], i), ArgStr(args.data[2], i));
 		SetStrResult(result, i, "ok");
+	}
+}
+// birdshot_add_role_grant_kind(role, resource_ref, cap, obj_kind) -> 'ok'
+// Kind-aware grant push (spec §1c). obj_kind is one of table/view/sequence/function/
+// type/schema/database (see ParseObjKind). Unknown cap OR kind -> the grant is dropped
+// (fail-closed, under-grant). Legacy callers keep using the 3-arg birdshot_add_role_grant
+// (defaults kind=table).
+static void AddRoleGrantKindFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 4; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		State::Get().AddRoleGrantKind(ArgStr(args.data[0], i), ArgStr(args.data[1], i), ArgStr(args.data[2], i),
+		                              ArgStr(args.data[3], i));
+		SetStrResult(result, i, "ok");
+	}
+}
+// birdshot_set_grant_store(kind, target) -> effective kind ('memory' | 'table')
+// Selects the grant-store backend at runtime (spec §0). 'memory' (default) keeps the
+// current in-memory-only behavior; 'table' records an ATTACH target/DSN for durable
+// write-through/load and reserves the protected `__birdshot` store catalog. An unknown
+// kind falls back to 'memory' (fail-closed: never half-enable a store). This is a
+// birdshot_* function so it is auto-denied on the wire by the parse-walk denylist.
+static void SetGrantStoreFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	for (idx_t c = 0; c < 2; c++)
+		args.data[c].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		std::string kind = ArgNull(args.data[0], i) ? "" : ArgStr(args.data[0], i);
+		std::string target = ArgNull(args.data[1], i) ? "" : ArgStr(args.data[1], i);
+		std::string eff = State::Get().SetGrantStore(kind, target);
+		SetStrResult(result, i, eff);
 	}
 }
 // birdshot_add_grant_constraint(role, table_ref, columns_csv, window_start, window_end) -> 'ok'
@@ -1080,6 +1180,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "birdshot_set_secret", {V}, V, SetSecretFn);
 	Register(loader, "birdshot_add_jwk", {V, V, V}, V, AddJwkFn);
 	Register(loader, "birdshot_add_role_grant", {V, V, V}, V, AddRoleGrantFn);
+	Register(loader, "birdshot_add_role_grant_kind", {V, V, V, V}, V, AddRoleGrantKindFn);
+	Register(loader, "birdshot_set_grant_store", {V, V}, V, SetGrantStoreFn);
 	Register(loader, "birdshot_add_grant_constraint", {V, V, V, V, V}, V, AddGrantConstraintFn);
 	Register(loader, "birdshot_set_lake_catalog", {V}, V, SetLakeCatalogFn);
 	Register(loader, "birdshot_add_user_role", {V, V}, V, AddUserRoleFn);

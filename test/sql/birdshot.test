@@ -1275,3 +1275,441 @@ query I
 SELECT birdshot_authorize('csess', 'SELECT title FROM main.todos, read_csv(''https://allowed.example/x.csv'')');
 ----
 false
+
+# ============================================================================
+# STAGE A: DML split + object-kind discriminator + IsProtectedRef + grant store
+# (spec §1/§2). A fresh config so the ALLOW paths are reachable; the suite above
+# already proves every class DENIES with no grant.
+# ============================================================================
+
+# ---- fixtures ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE main.dt(c1 INT, c2 INT);
+
+statement ok
+CREATE SEQUENCE main.sq;
+
+statement ok
+CREATE TABLE main.tb(c1 INT);
+
+# The protected grant-store table fixture. Created directly by the harness (NOT via
+# birdshot). No token may ever address it, even with a wildcard grant (see below).
+statement ok
+CREATE TABLE __birdshot_grants(k VARCHAR, v VARCHAR);
+
+# ---- fresh config: split-DML + kind-aware + wildcard roles ------------------
+
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+query I
+SELECT birdshot_set_lake_catalog('memory');
+----
+ok
+
+# wonly: legacy WRITE umbrella on main.dt (must cover all split DML + read).
+query I
+SELECT birdshot_add_role_grant('wonly', 'main.dt', 'write');
+----
+ok
+
+# ionly: INSERT only (fine-grained) on main.dt.
+query I
+SELECT birdshot_add_role_grant('ionly', 'main.dt', 'insert');
+----
+ok
+
+# uonly: UPDATE only, NO read — proves the LOCKED "UPDATE...WHERE needs read too".
+query I
+SELECT birdshot_add_role_grant('uonly', 'main.dt', 'update');
+----
+ok
+
+# fine: the four fine-grained DML caps + read on main.dt (realistic full-DML role).
+query I
+SELECT birdshot_add_role_grant('fine', 'main.dt', 'read');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('fine', 'main.dt', 'insert');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('fine', 'main.dt', 'update');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('fine', 'main.dt', 'delete');
+----
+ok
+
+# ronly: read only on main.dt.
+query I
+SELECT birdshot_add_role_grant('ronly', 'main.dt', 'read');
+----
+ok
+
+# kind role: drop on main.sq as a SEQUENCE, drop on main.tb as a TABLE (default),
+# create on the cs.* schema wildcard, a WILDCARD read (for the protected-ref test),
+# and a table-kind drop on the protected store table.
+query I
+SELECT birdshot_add_role_grant_kind('kr', 'main.sq', 'drop', 'sequence');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('kr', 'main.tb', 'drop');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('kr', 'cs.*', 'create');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('kr', '*', 'read');
+----
+ok
+
+query I
+SELECT birdshot_add_role_grant('kr', '__birdshot_grants', 'drop');
+----
+ok
+
+# users + tokens + sessions
+query I
+SELECT birdshot_add_user_role('wu', 'wonly');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('iu', 'ionly');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('uu', 'uonly');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('fu', 'fine');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('ru', 'ronly');
+----
+ok
+
+query I
+SELECT birdshot_add_user_role('ku', 'kr');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('wtok', 'wu');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('itok', 'iu');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('utok', 'uu');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('ftok', 'fu');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('rtok', 'ru');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('ktok', 'ku');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+query I
+SELECT birdshot_authenticate('wsess', 'wtok', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('isess', 'itok', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('usess', 'utok', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('fsess', 'ftok', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('rsess', 'rtok', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('ksess', 'ktok', '');
+----
+true
+
+# ---- WRITE umbrella back-compat: a legacy `write` grant still covers ALL DML ----
+
+query I
+SELECT birdshot_authorize('wsess', 'SELECT c1 FROM main.dt');
+----
+true
+
+query I
+SELECT birdshot_authorize('wsess', 'INSERT INTO main.dt VALUES (1, 2)');
+----
+true
+
+query I
+SELECT birdshot_authorize('wsess', 'UPDATE main.dt SET c1 = 1 WHERE c2 = 2');
+----
+true
+
+query I
+SELECT birdshot_authorize('wsess', 'DELETE FROM main.dt WHERE c1 = 1');
+----
+true
+
+# TRUNCATE maps to DELETE (v1.5.3: parses to an unconditioned DeleteStatement).
+# The WRITE umbrella covers DELETE + READ, so TRUNCATE is allowed here.
+query I
+SELECT birdshot_authorize('wsess', 'TRUNCATE main.dt');
+----
+true
+
+# ---- split DML: an INSERT-only grant allows INSERT, denies the rest ---------
+
+query I
+SELECT birdshot_authorize('isess', 'INSERT INTO main.dt VALUES (1, 2)');
+----
+true
+
+# INSERT-only cannot SELECT.
+query I
+SELECT birdshot_authorize('isess', 'SELECT c1 FROM main.dt');
+----
+false
+
+# INSERT-only cannot UPDATE (fine-grained caps cover only themselves).
+query I
+SELECT birdshot_authorize('isess', 'UPDATE main.dt SET c1 = 1 WHERE c2 = 2');
+----
+false
+
+# INSERT-only cannot DELETE.
+query I
+SELECT birdshot_authorize('isess', 'DELETE FROM main.dt WHERE c1 = 1');
+----
+false
+
+# INSERT ... SELECT FROM self needs {INSERT, READ}; read is missing -> deny.
+query I
+SELECT birdshot_authorize('isess', 'INSERT INTO main.dt SELECT c1, c2 FROM main.dt');
+----
+false
+
+# ---- LOCKED: UPDATE/DELETE do NOT imply READ -------------------------------
+# uonly holds UPDATE but not READ; UPDATE...WHERE requires BOTH -> deny.
+
+query I
+SELECT birdshot_authorize('usess', 'UPDATE main.dt SET c1 = 1 WHERE c2 = 2');
+----
+false
+
+# ---- fine-grained full-DML role: each cap works on its own action ----------
+
+query I
+SELECT birdshot_authorize('fsess', 'INSERT INTO main.dt VALUES (1, 2)');
+----
+true
+
+query I
+SELECT birdshot_authorize('fsess', 'UPDATE main.dt SET c1 = 1 WHERE c2 = 2');
+----
+true
+
+query I
+SELECT birdshot_authorize('fsess', 'DELETE FROM main.dt WHERE c1 = 1');
+----
+true
+
+query I
+SELECT birdshot_authorize('fsess', 'SELECT c1 FROM main.dt');
+----
+true
+
+# ---- read-only role: SELECT allowed, writes + TRUNCATE denied --------------
+
+query I
+SELECT birdshot_authorize('rsess', 'SELECT c1 FROM main.dt');
+----
+true
+
+query I
+SELECT birdshot_authorize('rsess', 'INSERT INTO main.dt VALUES (1, 2)');
+----
+false
+
+# TRUNCATE (maps to DELETE, which also scans -> needs DELETE+READ); read-only -> deny.
+query I
+SELECT birdshot_authorize('rsess', 'TRUNCATE main.dt');
+----
+false
+
+# ---- object-kind separation (DROP): a table-kind drop grant never satisfies a
+# sequence DROP, and vice versa (spec §1c). ----------------------------------
+
+# sequence-kind drop grant on main.sq satisfies DROP SEQUENCE main.sq -> allow.
+query I
+SELECT birdshot_authorize('ksess', 'DROP SEQUENCE main.sq');
+----
+true
+
+# ...but NOT a table DROP of the same name (only a sequence-kind grant exists) -> deny.
+query I
+SELECT birdshot_authorize('ksess', 'DROP TABLE main.sq');
+----
+false
+
+# table-kind drop grant on main.tb satisfies DROP TABLE main.tb -> allow.
+query I
+SELECT birdshot_authorize('ksess', 'DROP TABLE main.tb');
+----
+true
+
+# ...but NOT a sequence DROP of the same name (only a table-kind grant exists) -> deny.
+query I
+SELECT birdshot_authorize('ksess', 'DROP SEQUENCE main.tb');
+----
+false
+
+# back-compat (advisor R): TABLE and VIEW are ONE relation class (spec §8a), so the
+# legacy table-kind drop grant on main.tb ALSO covers DROP VIEW main.tb. Without the
+# TABLE≡VIEW rule in KindMatch this would wrongly deny — a silent regression, since
+# every legacy drop/alter grant is table-kind but `DROP VIEW` now carries VIEW kind.
+query I
+SELECT birdshot_authorize('ksess', 'DROP VIEW main.tb');
+----
+true
+
+# ...and the separation still holds the other way: main.sq has ONLY a sequence-kind
+# drop grant, so DROP VIEW main.sq (VIEW use) is NOT covered -> deny. TABLE≡VIEW does
+# not leak into the SEQUENCE class.
+query I
+SELECT birdshot_authorize('ksess', 'DROP VIEW main.sq');
+----
+false
+
+# ---- CREATE object types: SEQUENCE / TYPE / MACRO now emit a CREATE cap_use.
+# CREATE is schema-scoped (kind TABLE), so the cs.* create grant covers every kind. -
+
+query I
+SELECT birdshot_authorize('ksess', 'CREATE SEQUENCE cs.s1');
+----
+true
+
+query I
+SELECT birdshot_authorize('ksess', 'CREATE TYPE cs.ty AS ENUM (''a'', ''b'')');
+----
+true
+
+query I
+SELECT birdshot_authorize('ksess', 'CREATE MACRO cs.m() AS 1');
+----
+true
+
+# CREATE SEQUENCE in an UNGRANTED schema -> deny.
+query I
+SELECT birdshot_authorize('ksess', 'CREATE SEQUENCE other.s1');
+----
+false
+
+# CREATE INDEX stays fail-closed (resource model deferred) -> deny.
+query I
+SELECT birdshot_authorize('ksess', 'CREATE INDEX ix ON main.tb(c1)');
+----
+false
+
+# ---- IsProtectedRef: the grant store is unaddressable in BOTH planes --------
+# ku holds a WILDCARD read grant (`*`) that RefMatches everything, yet the store
+# table is DENIED anyway — protection overrides any grant, for every token.
+
+# bind-walk plane: SELECT of the protected table -> deny (despite wildcard read).
+query I
+SELECT birdshot_authorize('ksess', 'SELECT * FROM __birdshot_grants');
+----
+false
+
+# parse-walk plane: DROP of the protected table -> deny (despite the drop grant).
+query I
+SELECT birdshot_authorize('ksess', 'DROP TABLE __birdshot_grants');
+----
+false
+
+# DML plane: INSERT into the protected table -> deny.
+query I
+SELECT birdshot_authorize('ksess', 'INSERT INTO __birdshot_grants VALUES (''x'', ''y'')');
+----
+false
+
+# ---- Stage B: birdshot_set_grant_store config function ----------------------
+
+# default / explicit memory backend.
+query I
+SELECT birdshot_set_grant_store('memory', '');
+----
+memory
+
+# table backend selects the 'table' kind and reserves the protected store catalog.
+query I
+SELECT birdshot_set_grant_store('table', ':memory:');
+----
+table
+
+# unknown kind falls back to memory (fail-closed: never half-enable a store).
+query I
+SELECT birdshot_set_grant_store('bogus', 'x');
+----
+memory
+
+# a token can NEVER invoke the store config over the wire (birdshot_* denylist).
+query I
+SELECT birdshot_authorize('ksess', 'SELECT birdshot_set_grant_store(''table'', ''x'')');
+----
+false

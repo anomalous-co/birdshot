@@ -33,6 +33,7 @@
 // into BoundReference and destroys the bindings we read).
 // ============================================================================
 
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -84,7 +85,14 @@ struct BoundTableUse {
 	std::string catalog;
 	std::string schema;
 	std::string table;
-	Capability cap = Capability::READ; // READ for SELECT scans, WRITE for DML targets
+	// The SET of caps this table requires in the statement (spec §1d). One statement
+	// can require several on one table: `UPDATE t ... WHERE` -> {UPDATE, READ} (the
+	// LOGICAL_UPDATE target + the LOGICAL_GET scan), `INSERT INTO t SELECT FROM t` ->
+	// {INSERT, READ}. touch() UNIONs these across a batch. EVERY cap must be covered
+	// by some grant (BoundUseSatisfied). Never empty for a real use (fail closed if it
+	// somehow is). All bind-walk uses are TABLE kind (SELECT/DML target base tables).
+	std::set<Capability> caps;
+	ObjKind kind = ObjKind::TABLE;
 	std::unordered_set<std::string> read_cols; // lowercased real column names
 };
 
@@ -136,7 +144,7 @@ public:
 				if (written)
 					cols.push_back(LowerCopy(pc.GetName()));
 			}
-			AddWriteTable(ins.table, cols);
+			AddWriteTable(ins.table, cols, Capability::INSERT);
 			break;
 		}
 		case LogicalOperatorType::LOGICAL_UPDATE: {
@@ -147,12 +155,16 @@ public:
 			const ColumnList &cl = upd.table.GetColumns();
 			for (auto &pidx : upd.columns)
 				cols.push_back(LowerCopy(cl.GetColumn(pidx).GetName()));
-			AddWriteTable(upd.table, cols);
+			AddWriteTable(upd.table, cols, Capability::UPDATE);
 			break;
 		}
 		case LogicalOperatorType::LOGICAL_DELETE: {
 			auto &del = op.Cast<LogicalDelete>();
-			AddWriteTable(del.table, {});
+			// LOGICAL_DELETE covers both `DELETE FROM t` and `TRUNCATE t` — v1.5.3 parses
+			// TRUNCATE into a DeleteStatement indistinguishable from an unconditioned DELETE
+			// (same PGDeleteStmt), so both bind to LOGICAL_DELETE. Charged as DELETE. A
+			// distinct TRUNCATE cap has NO separate enforcement point here (documented).
+			AddWriteTable(del.table, {}, Capability::DELETE);
 			break;
 		}
 		case LogicalOperatorType::LOGICAL_CREATE_TABLE: {
@@ -191,13 +203,14 @@ public:
 	}
 
 private:
-	void AddWriteTable(duckdb::TableCatalogEntry &tbl, const std::vector<std::string> &write_cols) {
+	void AddWriteTable(duckdb::TableCatalogEntry &tbl, const std::vector<std::string> &write_cols, Capability cap) {
 		BoundTableUse u;
 		u.catalog = LowerCopy(tbl.ParentCatalog().GetName());
 		u.schema = LowerCopy(tbl.ParentSchema().name);
 		u.table = LowerCopy(tbl.name);
 		u.ref = QualifyRef(u.catalog, u.schema, u.table);
-		u.cap = Capability::WRITE;
+		u.caps.insert(cap); // INSERT / UPDATE / DELETE (split DML) — unioned with the
+		                    // scan GET's READ in touch() for UPDATE/DELETE (spec §1d).
 		for (auto &c : write_cols)
 			u.read_cols.insert(c); // written columns are charged like read columns
 		if (!IsSystemRef(u.catalog, u.schema, u.table))
@@ -212,9 +225,11 @@ private:
 		u.schema = LowerCopy(info.schema);
 		u.table = LowerCopy(info.table);
 		u.ref = QualifyRef(u.catalog, u.schema, u.table);
-		// LOGICAL_CREATE_TABLE remains WRITE in this chunk (CREATE→CREATE recategorisation
-		// is deferred to the bind-walk statement-coverage chunk per the implementation plan).
-		u.cap = Capability::WRITE;
+		// LOGICAL_CREATE_TABLE stays WRITE (defensive): CTAS is blocked at the parse-walk
+		// pre-filter (a CREATE class) before the bind-walk runs, so this never reaches
+		// authorize today. Kept as WRITE so that if a future pre-filter ever admitted CTAS,
+		// the new table is charged as a write target rather than silently allowed.
+		u.caps.insert(Capability::WRITE);
 		if (!IsSystemRef(u.catalog, u.schema, u.table))
 			write_tables.push_back(std::move(u));
 	}
@@ -272,7 +287,7 @@ inline BoundTableUse MakeBoundTableUse(duckdb::LogicalGet &get) {
 	u.schema = LowerCopy(tbl->ParentSchema().name);
 	u.table = LowerCopy(tbl->name);
 	u.ref = QualifyRef(u.catalog, u.schema, u.table);
-	u.cap = Capability::READ; // a GET is always a scan (read); DML targets come via AddWriteTable
+	u.caps.insert(Capability::READ); // a GET is always a scan (read); DML targets come via AddWriteTable
 	return u;
 }
 
@@ -298,11 +313,11 @@ inline bool BindAnalyzeStatement(duckdb::ClientContext &ctx, duckdb::SQLStatemen
 		auto it = acc.find(tu.ref);
 		if (it == acc.end())
 			it = acc.emplace(tu.ref, tu).first;
-		// Promote to WRITE if either the incoming or the existing entry requires it.
-		// Only READ/WRITE merge here; no general ordering is defined over all capabilities
-		// (CREATE/DROP/ALTER etc. are not yet produced by the bind-walk in this chunk).
-		if (tu.cap == Capability::WRITE)
-			it->second.cap = Capability::WRITE;
+		// UNION the required-cap sets (spec §1d): the same table scanned + written in one
+		// statement (e.g. UPDATE...WHERE -> a LOGICAL_UPDATE {UPDATE} and a LOGICAL_GET
+		// {READ}) accumulates {UPDATE, READ}, and BoundUseSatisfied then requires BOTH.
+		for (auto c : tu.caps)
+			it->second.caps.insert(c);
 		for (auto &c : tu.read_cols) // merge written/read columns (write-target charges)
 			it->second.read_cols.insert(c);
 		return it->second;
@@ -313,14 +328,26 @@ inline bool BindAnalyzeStatement(duckdb::ClientContext &ctx, duckdb::SQLStatemen
 		if (!get->GetTable())
 			continue; // table function / replacement scan — not a constrained table
 		BoundTableUse tu = MakeBoundTableUse(*get);
+		// IsProtectedRef (hard-DENY): the grant store is unaddressable in the bind
+		// plane too. Unlike IsSystemRef (skip-past-the-gate), a protected ref DENIES
+		// the whole statement (return false), never continues.
+		if (IsProtectedRef(tu.catalog, tu.schema, tu.table)) {
+			reason = "forbidden_protected_ref";
+			return false;
+		}
 		if (IsSystemRef(tu.catalog, tu.schema, tu.table))
 			continue; // introspection (duckdb_*/pg_*/information_schema) — never gated
 		touch(tu);
 		ti_to_ref[kv.first] = tu.ref;
 	}
 	// write/DDL targets.
-	for (auto &wt : v.write_tables)
+	for (auto &wt : v.write_tables) {
+		if (IsProtectedRef(wt.catalog, wt.schema, wt.table)) {
+			reason = "forbidden_protected_ref";
+			return false;
+		}
 		touch(wt);
+	}
 
 	// Charge every resolved column read to its table_index's table.
 	for (auto &b : v.bindings) {

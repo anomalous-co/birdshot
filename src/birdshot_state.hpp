@@ -43,30 +43,105 @@ struct JwkKey {
 // wired into the policy-check path in subsequent implementation chunks.
 //
 // Invariants enforced by Covers():
-//   WRITE ⊇ READ (write grant satisfies a read need)
-//   Every other pair is DISTINCT — no implicit cross-coverage.
+//   WRITE ⊇ { READ, INSERT, UPDATE, DELETE, TRUNCATE }  (legacy umbrella — back-compat)
+//   Every fine-grained capability covers ONLY itself (INSERT ⊉ UPDATE, etc.).
+//   LOCKED: UPDATE / DELETE do NOT imply READ — a query that both writes and reads
+//   a table requires BOTH caps via the multi-cap model (PG-faithful, spec §1b).
+//
+// The Capability numeric value is NEVER serialized — grants round-trip as the
+// string spellings via ParseCapability — so inserting new members anywhere is safe.
 enum class Capability : uint8_t {
 	READ,        // SELECT (catalog table)
-	WRITE,       // INSERT / UPDATE / DELETE  (write ⊇ read)
-	CREATE,      // CREATE TABLE / VIEW / SCHEMA / INDEX / CTAS target
+	WRITE,       // legacy DML umbrella (see Covers) — pushed today by the policy compiler
+	INSERT,      // INSERT (split DML)
+	UPDATE,      // UPDATE (split DML) — independent of READ
+	DELETE,      // DELETE (split DML) — independent of READ
+	TRUNCATE,    // TRUNCATE — NOTE: in DuckDB v1.5.3 `TRUNCATE t` parses to a
+	             // DeleteStatement indistinguishable from an unconditioned DELETE, so
+	             // the enforcement point collapses to DELETE (see birdshot_bind_analyze).
+	             // This cap exists for GRANT-authoring fidelity + the WRITE umbrella.
+	CREATE,      // CREATE TABLE / VIEW / SCHEMA / SEQUENCE / TYPE / MACRO / CTAS target
 	DROP,        // DROP
 	ALTER,       // ALTER (+ CREATE INDEX on a table)
+	USAGE,       // sequence nextval/currval, type use, schema use — Phase 2 (cap only now)
+	EXECUTE,     // function / macro call — Phase 2 (cap only now)
 	READ_SOURCE, // read_*/glob/COPY FROM source URI  — policy-gated, not RefMatch
 	COPY_TO,     // COPY TO / EXPORT destination URI  — policy-gated
 	ATTACH,      // ATTACH path/DSN                   — policy-gated
 	DETACH,      // DETACH (catalog alias)
 	INSTALL,     // INSTALL / LOAD extension name     — policy-gated
 	PRAGMA_SET,  // SET / PRAGMA (deny-by-default allowlist)
+	ADMIN,       // may run birdshot GRANT/REVOKE over the wire — Phase 3 (cap only now)
 };
 
 // True iff a grant with capability `g` covers a need for capability `u`.
-// Only WRITE ⊇ READ is implicit; every other capability must match exactly.
+// LOCKED semantics (spec §1b): the legacy WRITE umbrella covers READ + the four
+// split DML caps so existing `write` grants don't regress; every fine-grained cap
+// covers only itself. UPDATE/DELETE do NOT imply READ (independent, PG-faithful).
 inline bool Covers(Capability g, Capability u) {
 	if (g == u)
 		return true;
-	if (u == Capability::READ && g == Capability::WRITE)
-		return true; // write grant also satisfies a read need
-	return false;   // all other capabilities are mutually exclusive
+	if (g == Capability::WRITE) {
+		// Legacy umbrella: a `write` grant satisfies read + every split DML need.
+		return u == Capability::READ || u == Capability::INSERT || u == Capability::UPDATE ||
+		       u == Capability::DELETE || u == Capability::TRUNCATE;
+	}
+	return false; // all other capabilities are mutually exclusive
+}
+
+// ---- Object-kind discriminator --------------------------------------------
+//
+// A resource_ref is [catalog.]schema.name with NO object kind, so a sequence `s`
+// and a table `s` would collide. ObjKind separates them. BACK-COMPAT: every
+// existing grant/use predates this field and defaults to TABLE, so the entire
+// legacy test suite (all TABLE grants over TABLE uses) is unaffected.
+enum class ObjKind : uint8_t { TABLE, VIEW, SEQUENCE, FUNCTION, TYPE, SCHEMA, DATABASE };
+
+// True iff a grant of kind `g` may satisfy a use of kind `u`. STRICT: exact match,
+// EXCEPT (1) TABLE and VIEW are ONE "relation" class, and (2) a SCHEMA/DATABASE grant
+// DOMINATES the objects it contains (spec §1c/§8a/§8b) — so `GRANT ... ON SCHEMA s`
+// (kind SCHEMA) can cover a table/sequence use whose ref the grant's wildcard ref also
+// matches. Domination is grant-side only: a TABLE grant NEVER covers a SEQUENCE use
+// (that is the object-kind separation guarantee).
+inline bool KindMatch(ObjKind g, ObjKind u) {
+	if (g == u)
+		return true;
+	// TABLE ≡ VIEW (spec §8a groups table/view privileges). Required for back-compat:
+	// every legacy grant is TABLE kind, and `DROP VIEW`/`ALTER VIEW` now carry VIEW
+	// kind, so without this a legacy `drop`/`alter` grant would silently stop covering
+	// a view (a test-invisible regression). Data reads never hit this — a view is not a
+	// base-table GET (it expands to its underlying tables in the bind-walk), so VIEW
+	// kind only arises for DDL naming the view object itself.
+	if ((g == ObjKind::TABLE || g == ObjKind::VIEW) && (u == ObjKind::TABLE || u == ObjKind::VIEW))
+		return true;
+	return g == ObjKind::SCHEMA || g == ObjKind::DATABASE;
+}
+
+inline const char *ObjKindName(ObjKind k) {
+	switch (k) {
+	case ObjKind::TABLE:    return "table";
+	case ObjKind::VIEW:     return "view";
+	case ObjKind::SEQUENCE: return "sequence";
+	case ObjKind::FUNCTION: return "function";
+	case ObjKind::TYPE:     return "type";
+	case ObjKind::SCHEMA:   return "schema";
+	case ObjKind::DATABASE: return "database";
+	}
+	return "table";
+}
+
+// Parse an object-kind string (grant push path). Fail-closed on an unknown string:
+// returns false so the caller drops the grant (under-grant is the safe direction),
+// exactly like ParseCapability.
+inline bool ParseObjKind(const std::string &s, ObjKind &out) {
+	if (s == "table")    { out = ObjKind::TABLE;    return true; }
+	if (s == "view")     { out = ObjKind::VIEW;     return true; }
+	if (s == "sequence") { out = ObjKind::SEQUENCE; return true; }
+	if (s == "function") { out = ObjKind::FUNCTION; return true; }
+	if (s == "type")     { out = ObjKind::TYPE;     return true; }
+	if (s == "schema")   { out = ObjKind::SCHEMA;   return true; }
+	if (s == "database") { out = ObjKind::DATABASE; return true; }
+	return false;
 }
 
 // Parse a capability string produced by the policy compiler / host snapshot push.
@@ -77,9 +152,16 @@ inline bool Covers(Capability g, Capability u) {
 inline bool ParseCapability(const std::string &s, Capability &out) {
 	if (s == "read")        { out = Capability::READ;        return true; }
 	if (s == "write")       { out = Capability::WRITE;       return true; }
+	if (s == "insert")      { out = Capability::INSERT;      return true; }
+	if (s == "update")      { out = Capability::UPDATE;      return true; }
+	if (s == "delete")      { out = Capability::DELETE;      return true; }
+	if (s == "truncate")    { out = Capability::TRUNCATE;    return true; }
 	if (s == "create")      { out = Capability::CREATE;      return true; }
 	if (s == "drop")        { out = Capability::DROP;        return true; }
 	if (s == "alter")       { out = Capability::ALTER;       return true; }
+	if (s == "usage")       { out = Capability::USAGE;       return true; }
+	if (s == "execute")     { out = Capability::EXECUTE;     return true; }
+	if (s == "admin")       { out = Capability::ADMIN;       return true; }
 	if (s == "read_source") { out = Capability::READ_SOURCE; return true; }
 	if (s == "copy_to")     { out = Capability::COPY_TO;     return true; }
 	if (s == "attach")      { out = Capability::ATTACH;      return true; }
@@ -94,9 +176,16 @@ inline const char *CapabilityName(Capability c) {
 	switch (c) {
 	case Capability::READ:        return "read";
 	case Capability::WRITE:       return "write";
+	case Capability::INSERT:      return "insert";
+	case Capability::UPDATE:      return "update";
+	case Capability::DELETE:      return "delete";
+	case Capability::TRUNCATE:    return "truncate";
 	case Capability::CREATE:      return "create";
 	case Capability::DROP:        return "drop";
 	case Capability::ALTER:       return "alter";
+	case Capability::USAGE:       return "usage";
+	case Capability::EXECUTE:     return "execute";
+	case Capability::ADMIN:       return "admin";
 	case Capability::READ_SOURCE: return "read_source";
 	case Capability::COPY_TO:     return "copy_to";
 	case Capability::ATTACH:      return "attach";
@@ -118,6 +207,10 @@ inline const char *CapabilityName(Capability c) {
 struct Grant {
 	std::string resource_ref; // normalized ref (see above)
 	Capability cap = Capability::READ;
+	// Object kind this grant applies to. Defaults TABLE so every legacy grant
+	// (pushed with no kind) keeps its exact current meaning. A use is satisfied
+	// only by a grant whose kind KindMatch()es it (spec §1c).
+	ObjKind kind = ObjKind::TABLE;
 };
 
 // A finer-grained constraint attached to a role, scoped to one table. Layered on
@@ -212,7 +305,12 @@ public:
 	void AddJwk(const std::string &kid, const std::string &n_b64url, const std::string &e_b64url);
 	// AddRoleGrant: `cap_str` is a capability name string (see ParseCapability).
 	// Unknown capability strings are silently dropped (fail-closed: under-grant is safe).
+	// Object kind defaults to TABLE (back-compat).
 	void AddRoleGrant(const std::string &role, const std::string &resource_ref, const std::string &cap_str);
+	// Kind-aware grant push: same as AddRoleGrant but tags the grant with an ObjKind
+	// (see ParseObjKind). Unknown cap OR kind string -> drop the grant (fail-closed).
+	void AddRoleGrantKind(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+	                      const std::string &kind_str);
 	void AddGrantConstraint(const std::string &role, const std::string &table_ref,
 	                        const std::vector<std::string> &columns,
 	                        int32_t window_start_min, int32_t window_end_min);
@@ -228,6 +326,29 @@ public:
 	void AddAttachPolicy(const std::string &role, const std::string &pattern);
 
 	void Commit(); // promote staging -> live
+
+	// ---- pluggable grant store (spec §0) -------------------------------------
+	// The in-memory State is always the hot read model for authorize; the store is
+	// an optional durable backend (a `grants` table in an ATTACHed catalog). These
+	// are runtime backend config and live OUTSIDE the swappable snapshot (ResetStaging
+	// / Commit do not touch them). `kind` is "memory" (default, no persistence) or
+	// "table" (write-through/load against `catalog`). Unknown kind -> stay memory
+	// (fail-closed: never half-enable a store). Returns the effective kind.
+	//
+	// TODO(Stage B, spec §0): the transactional write-through + boot load against the
+	// ATTACHed store catalog is NOT yet wired. It must run its SQL on a store-internal
+	// connection (NOT a re-entrant query on the authorize/config ClientContext, which
+	// can deadlock), inside a transaction, and update `live_` on commit. Enforcement
+	// keeps reading the in-memory State (no per-query SQL on the hot path). The
+	// instant-deny bridge (REVOKE also touching deny_user_) lands with Phase-3 wire
+	// REVOKE. This pass implements: the config surface, the backend selector, and the
+	// hard-DENY protection of the store catalog (IsProtectedRef / IsProtectedCatalog).
+	std::string SetGrantStore(const std::string &kind, const std::string &target);
+	std::string GrantStoreKind();
+	std::string GrantStoreCatalog();
+	// True iff `catalog` (lowercased) is the configured grant-store catalog. Used by
+	// IsProtectedRef so no wire token can address the store catalog.
+	bool IsProtectedCatalog(const std::string &catalog);
 
 	// ---- sessions (authenticate writes, authorize reads) ---------------------
 	void PutSession(const std::string &sid, Identity id);
@@ -272,6 +393,11 @@ private:
 	std::mutex mtx_;
 	PolicySnapshot live_;
 	PolicySnapshot staging_;
+
+	// Grant-store backend config (outside the swappable snapshot; spec §0).
+	std::string store_kind_ = "memory"; // "memory" | "table"
+	std::string store_target_;          // ATTACH target / DSN (table backend)
+	std::string store_catalog_;         // protected catalog alias for the store
 
 	std::unordered_map<std::string, Identity> sessions_;
 	std::deque<std::string> session_order_; // insertion order for FIFO eviction

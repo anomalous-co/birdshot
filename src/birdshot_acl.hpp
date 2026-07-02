@@ -75,6 +75,12 @@
 #include "duckdb/parser/statement/load_statement.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/create_sequence_info.hpp"
+#include "duckdb/parser/parsed_data/create_type_info.hpp"
+#include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
@@ -91,6 +97,10 @@ enum class AclClass {
 struct TableUse {
 	std::string ref; // joined non-empty parts: "[catalog.][schema.]table", lowercased
 	Capability cap = Capability::READ; // READ for SELECT, WRITE for INSERT/UPDATE/DELETE
+	// Object kind of the target (spec §1c). Defaults TABLE so SELECT/DML table refs
+	// and legacy DDL uses keep their exact current meaning; DROP/ALTER thread the
+	// real CatalogType kind so `DROP SEQUENCE s` needs a sequence-kind drop grant.
+	ObjKind kind = ObjKind::TABLE;
 	// Raw, separately-kept components (lowercased) for column attribution +
 	// catalog positional resolution in Authorize. `catalog`/`schema` may be empty
 	// (unqualified ref). `alias` is the FROM-clause alias if one was given, else
@@ -183,6 +193,52 @@ inline bool IsSystemRef(const std::string &catalog, const std::string &schema, c
 	if (t.rfind("duckdb_", 0) == 0 || t.rfind("pragma_", 0) == 0 || s.rfind("pg_", 0) == 0)
 		return true;
 	return false;
+}
+
+// The INVERSE of IsSystemRef: a hard-DENY set (spec §0). IsSystemRef means
+// "always-allowed" (introspection tables skipped past the gate for quack's ATTACH
+// handshake). IsProtectedRef means "never-addressable-by-any-token" — the birdshot
+// grant store must be unreachable in EITHER plane, by EVERY token (admin included);
+// grants are changed only via GRANT/REVOKE executed internally, never raw DML.
+//
+// Reserved surface: the `__birdshot` catalog/schema and any `__birdshot`-prefixed
+// table name (so even a bare unqualified ref with no schema is caught), PLUS the
+// runtime-configured grant-store catalog (State::IsProtectedCatalog). Checked in
+// BOTH planes: the parse-walk (Analyze, over tables + cap_uses) and the bind-walk
+// (BindAnalyzeStatement) DENY the whole statement when any touched ref is protected.
+inline bool IsProtectedRef(const std::string &catalog, const std::string &schema, const std::string &table) {
+	auto c = LowerCopy(catalog), s = LowerCopy(schema), t = LowerCopy(table);
+	static const char kReserved[] = "__birdshot";
+	if (c.rfind(kReserved, 0) == 0 || s.rfind(kReserved, 0) == 0 || t.rfind(kReserved, 0) == 0)
+		return true;
+	// Runtime-configured store catalog (Stage B). Empty catalog on the use never
+	// matches (IsProtectedCatalog returns false on empty).
+	if (!c.empty() && State::Get().IsProtectedCatalog(c))
+		return true;
+	return false;
+}
+
+// Map a DuckDB CatalogType (DropInfo.type / AlterInfo.GetCatalogType() / CreateInfo.type)
+// to a birdshot ObjKind. Returns false (caller fails closed) for a CatalogType with no
+// ObjKind — e.g. INDEX/SECRET — so an object we can't kind-classify is never authorized.
+inline bool CatalogTypeToObjKind(duckdb::CatalogType ct, ObjKind &out) {
+	using duckdb::CatalogType;
+	switch (ct) {
+	case CatalogType::TABLE_ENTRY:    out = ObjKind::TABLE;    return true;
+	case CatalogType::VIEW_ENTRY:     out = ObjKind::VIEW;     return true;
+	case CatalogType::SEQUENCE_ENTRY: out = ObjKind::SEQUENCE; return true;
+	case CatalogType::TYPE_ENTRY:     out = ObjKind::TYPE;     return true;
+	case CatalogType::SCHEMA_ENTRY:   out = ObjKind::SCHEMA;   return true;
+	case CatalogType::DATABASE_ENTRY: out = ObjKind::DATABASE; return true;
+	case CatalogType::MACRO_ENTRY:
+	case CatalogType::TABLE_MACRO_ENTRY:
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+	case CatalogType::TABLE_FUNCTION_ENTRY:
+	case CatalogType::PRAGMA_FUNCTION_ENTRY: out = ObjKind::FUNCTION; return true;
+	default:
+		return false; // INDEX / SECRET / unknown -> fail closed
+	}
 }
 
 inline std::string QualifyRef(const std::string &catalog, const std::string &schema, const std::string &table) {
@@ -655,7 +711,7 @@ inline void WalkSetInfo(const duckdb::UpdateSetInfo &si, WalkCtx &ctx) {
 // and `schema` may be empty (unqualified DDL); the ref omits empty components so it
 // matches grants the same way a SELECT/DML ref does (via RefMatch).
 inline TableUse MakeCapUse(const std::string &catalog, const std::string &schema, const std::string &name,
-                           Capability cap) {
+                           Capability cap, ObjKind kind = ObjKind::TABLE) {
 	TableUse u;
 	u.catalog = LowerCopy(catalog);
 	u.schema = LowerCopy(schema);
@@ -663,6 +719,7 @@ inline TableUse MakeCapUse(const std::string &catalog, const std::string &schema
 	u.ref = QualifyRef(catalog, schema, name);
 	u.alias = u.table;
 	u.cap = cap;
+	u.kind = kind;
 	return u;
 }
 
@@ -783,10 +840,29 @@ inline bool AnalyzeStatement(const duckdb::SQLStatement &stmt, WalkCtx &ctx) {
 			ctx.cap_uses.push_back(MakeCapUse(ci.catalog, std::string(), ci.schema, Capability::CREATE));
 			return true;
 		}
-		// INDEX / SEQUENCE / TYPE / MACRO: the resource model for these (index → its
-		// table? sequence → its own name?) is deferred to the Phase-3 capability
-		// surfacing — fail closed for now (deny-safe; DROP/ALTER of them are already
-		// generic via DropInfo/AlterInfo catalog.schema.name).
+		if (ci.type == CatalogType::SEQUENCE_ENTRY) {
+			auto &si = ci.Cast<CreateSequenceInfo>();
+			ctx.cap_uses.push_back(MakeCapUse(ci.catalog, ci.schema, si.name, Capability::CREATE));
+			return true;
+		}
+		if (ci.type == CatalogType::TYPE_ENTRY) {
+			auto &tyi = ci.Cast<CreateTypeInfo>();
+			ctx.cap_uses.push_back(MakeCapUse(ci.catalog, ci.schema, tyi.name, Capability::CREATE));
+			return true;
+		}
+		if (ci.type == CatalogType::MACRO_ENTRY || ci.type == CatalogType::TABLE_MACRO_ENTRY) {
+			auto &mi = ci.Cast<CreateMacroInfo>();
+			ctx.cap_uses.push_back(MakeCapUse(ci.catalog, ci.schema, mi.name, Capability::CREATE));
+			return true;
+		}
+		// CREATE object kind on a CREATE cap_use is intentionally left TABLE (the default
+		// in MakeCapUse): CREATE is a SCHEMA-scoped privilege (PG-faithful), so a single
+		// `create` grant on the schema (`s.*`) covers creating ANY object kind in it. The
+		// object-kind discriminator instead gates DROP/ALTER (below), where you name a
+		// specific typed object. See spec §1c / §8b and the report's back-compat note.
+		//
+		// CREATE INDEX stays fail-closed (TODO Phase-2/3): its resource model (index → its
+		// underlying table, or its own name?) is unresolved. DO NOT expand this pass.
 		ctx.forbidden = true;
 		ctx.reason = "forbidden_create_type";
 		return false;
@@ -804,7 +880,16 @@ inline bool AnalyzeStatement(const duckdb::SQLStatement &stmt, WalkCtx &ctx) {
 			ctx.reason = "forbidden_drop_system";
 			return false;
 		}
-		ctx.cap_uses.push_back(MakeCapUse(di.catalog, di.schema, di.name, Capability::DROP));
+		// Thread the real object kind so `DROP SEQUENCE s` needs a sequence-kind drop
+		// grant, not a table-kind one (spec §1c). An unclassifiable kind (INDEX/SECRET)
+		// -> fail closed.
+		ObjKind dk;
+		if (!CatalogTypeToObjKind(di.type, dk)) {
+			ctx.forbidden = true;
+			ctx.reason = "forbidden_drop_kind";
+			return false;
+		}
+		ctx.cap_uses.push_back(MakeCapUse(di.catalog, di.schema, di.name, Capability::DROP, dk));
 		return true;
 	}
 	case StatementType::ALTER_STATEMENT: {
@@ -820,7 +905,14 @@ inline bool AnalyzeStatement(const duckdb::SQLStatement &stmt, WalkCtx &ctx) {
 			ctx.reason = "forbidden_alter_system";
 			return false;
 		}
-		ctx.cap_uses.push_back(MakeCapUse(ai.catalog, ai.schema, ai.name, Capability::ALTER));
+		// Thread the real object kind (spec §1c). Unclassifiable -> fail closed.
+		ObjKind ak;
+		if (!CatalogTypeToObjKind(ai.GetCatalogType(), ak)) {
+			ctx.forbidden = true;
+			ctx.reason = "forbidden_alter_kind";
+			return false;
+		}
+		ctx.cap_uses.push_back(MakeCapUse(ai.catalog, ai.schema, ai.name, Capability::ALTER, ak));
 		return true;
 	}
 	case StatementType::COPY_STATEMENT: {
@@ -941,6 +1033,25 @@ inline AclAnalysis Analyze(const std::string &sql) {
 		a.cls = AclClass::PARSE_ERR;
 		a.reason = "extract_error";
 		return a;
+	}
+
+	// IsProtectedRef (hard-DENY set): the grant store must be unaddressable in the
+	// parse plane. Every SELECT/DML source/target lands in `tables`; every
+	// CREATE/DROP/ALTER/COPY target lands in `cap_uses` — so scanning both catches
+	// every statement class that names a ref. Any protected ref -> FORBIDDEN.
+	for (const auto &u : ctx.tables) {
+		if (IsProtectedRef(u.catalog, u.schema, u.table)) {
+			a.cls = AclClass::FORBIDDEN;
+			a.reason = "forbidden_protected_ref";
+			return a;
+		}
+	}
+	for (const auto &u : ctx.cap_uses) {
+		if (IsProtectedRef(u.catalog, u.schema, u.table)) {
+			a.cls = AclClass::FORBIDDEN;
+			a.reason = "forbidden_protected_ref";
+			return a;
+		}
 	}
 
 	a.tables = std::move(ctx.tables);
