@@ -618,6 +618,18 @@ store) and bumps `version`; it stops pushing `birdshot_add_role_grant` tuples fo
 JWKS / lake-catalog setup may remain scalar config. The engine already works standalone without any of
 this, so it is sequenced last.
 
+**HARD WRITER OBLIGATIONS (from the phase-3.5 finding — a mismatch fails CLOSED / under-enforces, never
+over-grants, but silently denies legitimate access):**
+- A `grantee_kind='role'` row's stmt MUST use **`TO ROLE <r>`**. birdshot keys the applied grant to the
+  principal named in the stmt's `TO` clause (§12c); a bare `TO <r>` parses as a *subject* → the
+  subject-self-role of "<r>", which a *member* of role `<r>` never holds → the grant silently never
+  enforces. (`grantee_kind`/`grantee` only filter WHICH rows load; the `TO` clause decides WHO the grant
+  is for — the two must not disagree.)
+- **Generate `grantee_kind`/`grantee` FROM the parsed stmt**, not independently — the columns are
+  redundant with the `TO` clause, so deriving them from it makes drift structurally impossible (the
+  clean fix for the redundancy, landed with the writer rather than as a reader-side guard). PUBLIC rows
+  use `grantee=''` (empty string, NOT NULL), matching the `= ?`-bound pull.
+
 ### 12g. Phasing (advisor-sequenced; do NOT ship as one blob)
 1. **RefMatch catalog-safe wildcards — DONE** (commit `0579dfc`).
 2. **Store-holds-SQL + protection + trusted internal connection.** Prove `__birdshot_grants` and its

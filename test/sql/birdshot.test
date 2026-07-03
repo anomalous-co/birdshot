@@ -2262,16 +2262,24 @@ CREATE TABLE __birdshot_grants(grantee_kind VARCHAR, grantee VARCHAR, stmt VARCH
 statement ok
 CREATE TABLE main.hyd(id INT, title VARCHAR);
 
+# A role-only table (NO public/subject grant) so the transitive-role path is tested in
+# ISOLATION — a bare `TO r1` here would silently key to the subject-self-role of "r1"
+# (which bob, a member of the ROLE r1, never holds) and under-enforce; the store contract
+# is that a grantee_kind='role' row's stmt MUST use `TO ROLE <r>` (§12a/§12f).
+statement ok
+CREATE TABLE main.hrole(id INT, title VARCHAR);
+
 # alice: a direct subject grant (no scalar birdshot_add_role_grant ever ran for her).
 statement ok
 INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'GRANT SELECT ON main.hyd TO alice', 0);
 
-# bob: role membership + the role's own grant -> transitive hydration.
+# bob: role membership + the role's own grant on a PUBLIC-free table -> transitive
+# hydration, genuinely isolated (bob reaches main.hrole ONLY via role r1).
 statement ok
 INSERT INTO __birdshot_grants VALUES ('subject', 'bob', 'GRANT r1 TO bob', 0);
 
 statement ok
-INSERT INTO __birdshot_grants VALUES ('role', 'r1', 'GRANT SELECT ON main.hyd TO r1', 0);
+INSERT INTO __birdshot_grants VALUES ('role', 'r1', 'GRANT SELECT ON main.hrole TO ROLE r1', 0);
 
 # PUBLIC: must reach a subject with no subject/role rows of its own (carol).
 statement ok
@@ -2371,13 +2379,21 @@ SELECT birdshot_authorize('hsa', 'SELECT id FROM main.hyd');
 ----
 true
 
-# bob: transitive role r1 grant enforced.
+# bob: transitive role r1 grant enforced on the PUBLIC-free table — this can ONLY pass
+# via the role path (no PUBLIC/subject grant on main.hrole), so it genuinely isolates it.
 query I
-SELECT birdshot_authorize('hsb', 'SELECT id FROM main.hyd');
+SELECT birdshot_authorize('hsb', 'SELECT id FROM main.hrole');
 ----
 true
 
-# carol: only PUBLIC reaches her (no subject/role rows) — still allowed.
+# carol (PUBLIC only, no role) is DENIED on main.hrole — proves the role path is what
+# gives bob access there, and that PUBLIC does NOT leak onto the role-only table.
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hrole');
+----
+false
+
+# carol: only PUBLIC reaches her (no subject/role rows) — allowed on the PUBLIC table.
 query I
 SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
 ----

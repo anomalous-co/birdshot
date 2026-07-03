@@ -129,6 +129,10 @@ std::string State::GrantStoreCatalog() {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return store_catalog_;
 }
+std::string State::GrantStoreSchema() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return store_schema_;
+}
 bool State::IsProtectedCatalog(const std::string &catalog) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return !store_catalog_.empty() && catalog == store_catalog_;
@@ -1992,7 +1996,26 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 		// Trusted internal connection (NOT the wire path). Parameterized pull only:
 		// `sub`/grantee is attacker-controlled and is NEVER concatenated into SQL.
 		duckdb::Connection con(*ctx.db);
-		auto prep = con.Prepare("SELECT stmt FROM __birdshot_grants WHERE grantee_kind = ? AND grantee = ?");
+
+		// Catalog-qualify the pull by the configured store catalog (§12h). For the
+		// production Postgres backend the store table lives in an ATTACHed protected
+		// catalog (`__birdshot.<schema>.__birdshot_grants`), so an unqualified
+		// `__birdshot_grants` — which resolves only in the default `memory.main` — would
+		// miss it. Discriminate on ACTUAL attachment: if a catalog named `store_catalog_`
+		// is attached, fully qualify `<catalog>.<schema>.__birdshot_grants`; otherwise
+		// (LOCAL backend, table in `memory.main`) keep the bare name. This keeps the
+		// local-backend path (and its sqllogictest) working unchanged while making the
+		// Postgres backend resolve — WITHOUT ever putting the store catalog in the agent
+		// search path (which would expose it to wire queries). The catalog/schema are
+		// birdshot-internal constants (never attacker input); only `sub` is bound.
+		std::string store_cat = st.GrantStoreCatalog();
+		std::string table_ref = "__birdshot_grants";
+		if (!store_cat.empty() && Catalog::GetCatalogEntry(ctx, store_cat)) {
+			std::string schema = st.GrantStoreSchema();
+			table_ref = "\"" + store_cat + "\".\"" + schema + "\".\"__birdshot_grants\"";
+		}
+		auto prep = con.Prepare("SELECT stmt FROM " + table_ref +
+		                        " WHERE grantee_kind = ? AND grantee = ?");
 		if (!prep || prep->HasError()) {
 			st.PoisonSubject(sub);
 			return;

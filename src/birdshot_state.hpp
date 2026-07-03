@@ -412,6 +412,11 @@ public:
 	std::string SetGrantStore(const std::string &kind, const std::string &target);
 	std::string GrantStoreKind();
 	std::string GrantStoreCatalog();
+	// Schema the store table lives under WITHIN the ATTACHed store catalog (§12h).
+	// Over the DuckDB postgres scanner a pglite/Postgres table in `public` surfaces as
+	// `<catalog>.public.<table>`, so this defaults to "public". Lives outside the
+	// swappable snapshot (like the store catalog) so reset/commit never wipe it.
+	std::string GrantStoreSchema();
 	// True iff `catalog` (lowercased) is the configured grant-store catalog. Used by
 	// IsProtectedRef so no wire token can address the store catalog.
 	bool IsProtectedCatalog(const std::string &catalog);
@@ -479,6 +484,7 @@ private:
 	std::string store_kind_ = "memory"; // "memory" | "table"
 	std::string store_target_;          // ATTACH target / DSN (table backend)
 	std::string store_catalog_;         // protected catalog alias for the store
+	std::string store_schema_ = "public"; // schema of the store table in the ATTACHed catalog (§12h)
 	std::set<std::string> hydrated_subjects_;    // §12c: subjects already lazy-pulled
 	std::set<std::string> poisoned_subjects_;    // §12b: hydration failed -> deny at authorize
 	std::set<std::string> applied_grantee_keys_; // apply-once dedup: (kind,grantee) already applied
