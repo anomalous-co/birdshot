@@ -573,26 +573,62 @@ infinite recursion. "A token we haven't seen" maps naturally to attach-time: pul
 Requirement (user): the in-memory `State` is never trusted stale — birdshot validates that grants
 haven't changed and roles are current. For GRANT staleness is harmless (under-grant); **for REVOKE it
 fails OPEN** — the whole reason this is mandatory.
-- **Epoch signal:** the store's monotonic `version` is bumped by the control plane on every mutation.
-  birdshot records the version it hydrated a subject at.
-- **Freshness gate on authorize:** if the store epoch has advanced past the subject's hydrated epoch,
-  re-hydrate that subject before deciding. To keep this off a per-query round-trip, the epoch is read at
-  a **bounded cadence** (cached ≤T, or driven by PG `LISTEN/NOTIFY`), so steady-state authorize stays
-  in-memory and staleness is bounded to T. (Strong per-query validation is available as a high-assurance
-  mode — §7 product decision on the T/round-trip trade-off.)
-- **Instant-deny bridge for REVOKE:** a REVOKE also pushes the affected `(subject[,ref])` onto the
-  existing instant-revocation denylist (checked FIRST in authorize), closing the window immediately and
-  locally before the epoch catches up. This is what makes "up to date" real for revocation.
+- **Epoch signal:** a dedicated single-row table `__birdshot_meta(epoch BIGINT)` in the store (NOT the
+  per-row `version` column — that orders rows within a key, §12a) is the freshness epoch, bumped by the
+  control plane on every mutation. birdshot records `hydrated_epoch_` = the epoch it last flushed-and-
+  rehydrated at.
 - **Token role validity:** role membership is part of the hydrated set and covered by the same epoch;
   token-level revocation/expiry stays on JWT `exp` + the instant-deny list.
-- **Fail-closed on validation failure:** if the freshness check can't reach the store → DENY (a store
-  outage denies queries — correctness over availability, accepted; a bounded last-known-good grace is a
-  §7 option, default off).
 
-**Provisional decisions (2026-07-02, chosen while the user was away — revisit on request):**
-- *Cadence* = **strong per-query epoch**: every authorize does a cheap single-row epoch read on the
-  store's internal connection; re-hydrate the subject only when the epoch advanced. Literal "up to date."
-  Perf optimization (epoch cached ≤T, or PG `LISTEN/NOTIFY`) is future work, not a semantics change.
+**AS-BUILT (2026-07-02, phase-4 — the flush/re-hydrate SPLIT is load-bearing):** the freshness gate runs
+at the TOP of `Authorize` (table mode only), after `GetSession` resolves the identity and BEFORE the
+poison check, using birdshot's trusted internal connection (`ReadStoreEpoch` — same catalog-qualification
+as the grant pull, §12h). Per authorize:
+```
+E = read_epoch(ctx)                 // SELECT epoch FROM <qualified>__birdshot_meta
+if E > hydrated_epoch_:
+    FlushHydrated()                 // GLOBAL: drop the WHOLE hydrated cache, once
+    hydrated_epoch_ = E
+HydrateSubject(ctx, id.user_id)     // PER-SUBJECT ensure_hydrated — runs EVERY authorize, no-op if hydrated
+// then the existing SubjectPoisoned check denies if that hydration just failed
+```
+- **Flush GLOBAL, re-hydrate PER-SUBJECT — do NOT collapse.** `FlushHydrated()` erases ONLY hydrated
+  grant state (for every applied `(kind,grantee)` key, its role-keyed entry in `role_grants` +
+  `role_constraints`, translated through the shared header-inline `SubjectSelfRole`/`PublicRole` so the
+  mapping can never drift; then clears `applied_grantee_keys_`/`hydrated_subjects_`/`poisoned_subjects_`).
+  It does NOT touch scalar config (auth/JWKS/tokens/lake/`*_policies`) or `user_roles`. Because the flush
+  is global (A's, B's, shared-role and PUBLIC keys all go) but the epoch is bumped ONCE, re-hydrating only
+  the bumping subject would leave every OTHER live session with erased-and-never-reapplied keys → silently
+  denied on legitimately-granted tables. So `HydrateSubject` runs on EVERY authorize (outside the epoch
+  branch), lazily re-populating each subject. Hydration is thus lazy-on-authorize; the old Authenticate-
+  time hydration call is REMOVED (Authenticate now only binds the session).
+- **Pull ORDER BY version:** `HydrateSubject`'s pull is `… WHERE grantee_kind=? AND grantee=? ORDER BY
+  version`, so an append-only writer's GRANT(v_n) then later REVOKE(v_m>n) in the same key apply in issue
+  order (`RevokeLive` removes the grant only when it lands after it).
+- **REVOKE handling (strong mode, no separate instant-deny bridge):** a store REVOKE bumps the epoch → the
+  next query flushes → re-hydrates → denies. BOTH writer strategies work: (a) append a `REVOKE …` row
+  (applied after the GRANT via ORDER BY version → `RevokeLive`), and (b) delete the GRANT row (flush + re-
+  pull simply doesn't re-add it). CAVEAT (folded into §12f writer obligations): a *role-membership* revoke
+  MUST be an appended `REVOKE ROLE …` row, never a row DELETION — `user_roles` survives the flush, so a
+  deleted membership on a role with other members leaves a stale edge → fail-open.
+- **Lock discipline:** `FlushHydrated` takes the State lock; `HydrateSubject`'s apply self-locks (the lock
+  is NOT held across `BirdshotApplyGrantOps`). The brief flushed-but-not-yet-repopulated window a
+  concurrent authorize may observe reads empty == denies == fail-safe.
+
+**Fail-closed contract — table mode ⇒ epoch REQUIRED (no "is freshness active" discriminator):** in table
+mode the epoch read MUST succeed; ANY failure (missing `__birdshot_meta` / prepare-or-execute error / zero
+rows / NULL / connection lost) → **fail-closed DENY** for this authorize, via a dedicated audit reason
+`freshness_unavailable`. It deliberately does NOT poison the subject (poison persists, and
+`HydrateSubject` short-circuits on an already-hydrated subject before clearing poison, so poisoning on a
+transient read failure could stick closed until the next epoch bump). Distinguishing "meta table absent"
+from "store unreachable" is deliberately NOT attempted — that discriminator would be a fail-OPEN trap.
+`TODO(perf)`: reuse one long-lived internal connection instead of opening one per authorize
+(correctness first).
+
+**Decisions (locked):**
+- *Cadence* = **strong per-query epoch**: every authorize reads `__birdshot_meta.epoch` on the store's
+  internal connection; flush+re-hydrate only when the epoch advanced. Literal "up to date." Perf
+  optimization (epoch cached ≤T, or PG `LISTEN/NOTIFY`) is future work, not a semantics change.
 - *Store outage* = **fail-closed (deny)** — no grace window by default (consistent with the fail-closed
   ethos everywhere else in birdshot). A bounded grace stays a §7 opt-in.
 
@@ -626,9 +662,24 @@ over-grants, but silently denies legitimate access):**
   enforces. (`grantee_kind`/`grantee` only filter WHICH rows load; the `TO` clause decides WHO the grant
   is for — the two must not disagree.)
 - **Generate `grantee_kind`/`grantee` FROM the parsed stmt**, not independently — the columns are
-  redundant with the `TO` clause, so deriving them from it makes drift structurally impossible (the
-  clean fix for the redundancy, landed with the writer rather than as a reader-side guard). PUBLIC rows
-  use `grantee=''` (empty string, NOT NULL), matching the `= ?`-bound pull.
+  redundant with the `TO` clause, so deriving them from it makes drift structurally impossible. PUBLIC
+  rows use `grantee=''` (empty string, NOT NULL), matching the `= ?`-bound pull. **Reader-side defense
+  (phase 4):** `FlushHydrated` erases the role_keys hydration APPLY actually wrote (`hydrated_role_keys_`,
+  recorded from each `g/gc/r/rc` op via the same `GrantRoleKeyFor` mapping), NOT a re-translation of the
+  store columns — so even a drifted column can't strand a live grant past a REVOKE on the flush path
+  (which would be fail-OPEN on the exact operation the gate enforces). The writer obligation still stands;
+  the reader no longer *depends* on it for flush correctness. Guarded by the `main.drift` delete-on-revoke
+  regression in `test/sql/birdshot.test`.
+- **A role-membership REVOKE MUST be an appended `REVOKE ROLE <r> FROM <subj>` row, never a row
+  DELETION** (phase-4 finding, §12d). The freshness flush drops `role_grants`/`role_constraints` but
+  deliberately preserves `user_roles`; a hydration-added membership edge is corrected on re-hydrate only
+  by an appended `rr` op. Deleting the `GRANT <r> TO <subj>` row instead leaves the stale edge, so if the
+  role has other members its grants re-hydrate and the "revoked" subject still inherits them → fail-open.
+  (Table/column-grant revokes are safe under EITHER strategy, because `role_grants`/`role_constraints`
+  ARE flushed.)
+- **Every mutation MUST bump `__birdshot_meta.epoch`** (§12d) in the same transaction that writes/deletes
+  the grant row — the epoch is the ONLY signal birdshot re-reads; an unbumped mutation is invisible until
+  some later bump.
 
 ### 12g. Phasing (advisor-sequenced; do NOT ship as one blob)
 1. **RefMatch catalog-safe wildcards — DONE** (commit `0579dfc`).
@@ -636,7 +687,10 @@ over-grants, but silently denies legitimate access):**
    catalog are unaddressable by any token in BOTH planes before anything reads them.
 3. **Lazy hydration at attach** (12b/12c) — parameterized, parse-only, fail-closed, bounded recursion.
    Do NOT wire pull into live authorize until protection + parameterization + fail-closed are all in.
-4. **Freshness gate** (12d) — epoch/NOTIFY + instant-deny bridge.
+4. **Freshness gate** (12d) — DONE. Strong per-query `__birdshot_meta.epoch`; global flush + per-authorize
+   ensure_hydrated (the split is load-bearing); epoch-REQUIRED fail-closed; pull ORDER BY version. Strong
+   mode needs no separate instant-deny bridge (the epoch bump IS the instant signal). NOTIFY/cached-≤T
+   cadence is a perf optimization, not a semantics change (future).
 5. **Control-plane rewrite** (12f) + **drop windows** (12e).
 
 ## Primary sources

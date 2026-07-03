@@ -2259,6 +2259,17 @@ DROP TABLE __birdshot_grants;
 statement ok
 CREATE TABLE __birdshot_grants(grantee_kind VARCHAR, grantee VARCHAR, stmt VARCHAR, version BIGINT);
 
+# §12d freshness gate: in table mode the store epoch is REQUIRED (fail-closed — every
+# authorize reads __birdshot_meta; a missing/unreadable epoch DENIES). This static row
+# (epoch=0, never bumped) means exactly one hydration and no re-hydration, so the
+# assertions below hold unchanged while still exercising the freshness read path. A
+# separate case further down BUMPS this epoch to prove REVOKE takes effect.
+statement ok
+CREATE TABLE __birdshot_meta(epoch BIGINT);
+
+statement ok
+INSERT INTO __birdshot_meta VALUES (0);
+
 statement ok
 CREATE TABLE main.hyd(id INT, title VARCHAR);
 
@@ -2272,6 +2283,15 @@ CREATE TABLE main.hrole(id INT, title VARCHAR);
 # alice: a direct subject grant (no scalar birdshot_add_role_grant ever ran for her).
 statement ok
 INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'GRANT SELECT ON main.hyd TO alice', 0);
+
+# alice-ONLY table (no PUBLIC, no role grant): her access is reachable ONLY via her
+# direct subject grant, so the §12d freshness case below can REVOKE it and observe a
+# genuine deny (revoking her grant on main.hyd would NOT deny her — PUBLIC still covers it).
+statement ok
+CREATE TABLE main.asolo(id INT, title VARCHAR);
+
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'GRANT SELECT ON main.asolo TO alice', 0);
 
 # bob: role membership + the role's own grant on a PUBLIC-free table -> transitive
 # hydration, genuinely isolated (bob reaches main.hrole ONLY via role r1).
@@ -2297,6 +2317,20 @@ INSERT INTO __birdshot_grants VALUES ('subject', 'mo', 'GRANT SELECT ON main.hyd
 
 statement ok
 INSERT INTO __birdshot_grants VALUES ('subject', 'mo', 'GRANT bogus_priv ON main.hyd TO mo', 0);
+
+# dx: a DRIFTED row — grantee_kind='subject'/'dx' (the pull key) but the stmt applies to
+# ROLE rr (the apply key). dx is a member of rr, so dx reaches main.drift via rr. This
+# distinguishes the flush keying: apply writes role_key `rr`; a column-based flush would
+# erase `subject-self-role(dx)` and STRAND the rr grant past a delete-on-revoke (fail OPEN).
+# FlushHydrated erases the APPLIED role_key (rr), so the §12d case below denies correctly.
+statement ok
+CREATE TABLE main.drift(id INT, title VARCHAR);
+
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'dx', 'GRANT rr TO dx', 0);
+
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'dx', 'GRANT SELECT ON main.drift TO ROLE rr', 0);
 
 # ---- config: service tokens bind sessions to the store subjects -------------
 query I
@@ -2331,6 +2365,11 @@ ok
 
 query I
 SELECT birdshot_add_service_token('hy-mo', 'mo');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('hy-dx', 'dx');
 ----
 ok
 
@@ -2429,5 +2468,123 @@ false
 
 query I
 SELECT birdshot_authorize('hsa', 'SELECT stmt FROM __birdshot_grants WHERE grantee = ''alice''');
+----
+false
+
+# ==========================================================================
+# Freshness gate (spec §12d) — strong per-query epoch, fail-closed
+# ==========================================================================
+#
+# Every authorize (table mode) reads __birdshot_meta.epoch. When it advances past
+# the epoch birdshot last flushed-and-rehydrated at, the WHOLE hydrated cache is
+# flushed GLOBALLY (once) and each subject is re-hydrated lazily on its next
+# authorize. A store-side REVOKE therefore takes effect WITHOUT re-authenticating.
+
+# ---- unchanged epoch (0): no spurious re-hydration, prior decisions hold -----
+# Asserted BEFORE any bump so these pass because the cache is untouched (not merely
+# because a re-hydrate happened to re-grant). alice + carol were hydrated above.
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.asolo');
+----
+true
+
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
+----
+true
+
+# ---- store-side REVOKE + epoch bump -> deny on the NEXT query ----------------
+# Append a REVOKE row for alice at a HIGHER version (append-only writer, §12d
+# strategy a). ORDER BY version applies GRANT(v0) then REVOKE(v1) -> RevokeLive
+# nets to no grant. version is BIGINT; alice's original asolo grant row is version 0.
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'REVOKE SELECT ON main.asolo FROM alice', 1);
+
+# Bump the epoch. This is the ONLY signal; no re-authenticate, no config reload.
+statement ok
+UPDATE __birdshot_meta SET epoch = 1;
+
+# alice's NEXT authorize (same session hsa) now DENIES on her formerly-granted
+# alice-only table: epoch advanced -> global flush -> alice re-hydrates GRANT then
+# REVOKE in version order -> revoked. (Her PUBLIC access to main.hyd is untouched.)
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.asolo');
+----
+false
+
+# CROSS-SUBJECT NON-STRANDING: the flush was GLOBAL (it cleared carol's PUBLIC key
+# and bob's role key too), but re-hydrate is PER-AUTHORIZE, so carol and bob are
+# re-populated on their own next query — NOT silently stranded by alice's bump.
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
+----
+true
+
+query I
+SELECT birdshot_authorize('hsb', 'SELECT id FROM main.hrole');
+----
+true
+
+# Idempotent at the same epoch: alice stays denied, carol stays allowed (no churn).
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.asolo');
+----
+false
+
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
+----
+true
+
+# ---- fail-closed: epoch unreadable -> DENY (table mode requires the epoch) ----
+# Drop the meta table; the epoch read now fails -> every table-mode authorize denies,
+# even for a subject (carol) that is cleanly hydrated and granted via PUBLIC.
+statement ok
+DROP TABLE __birdshot_meta;
+
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
+----
+false
+
+# Restore the meta table (epoch back at 1, matching hydrated_epoch_): reads succeed
+# again, no flush, and carol is served from the still-warm cache -> allowed.
+statement ok
+CREATE TABLE __birdshot_meta(epoch BIGINT);
+
+statement ok
+INSERT INTO __birdshot_meta VALUES (1);
+
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
+----
+true
+
+# ---- flush keying: delete-on-revoke of a DRIFTED grant must take effect -------
+# dx reaches main.drift via role rr — a grant whose store column is subject/dx but whose
+# stmt applies TO ROLE rr (apply key = rr). Authenticate; the first query hydrates dx at
+# the current epoch (1 == hydrated_epoch_, so no flush, just ensure_hydrated).
+query I
+SELECT birdshot_authenticate('hsdx', 'hy-dx', '');
+----
+true
+
+query I
+SELECT birdshot_authorize('hsdx', 'SELECT id FROM main.drift');
+----
+true
+
+# Delete-on-revoke: drop the drift grant row (keep the rr membership) and bump the epoch.
+# There is NO appended REVOKE row, so the ONLY way the next query denies is if FlushHydrated
+# erased the APPLIED role_key (rr). A column-based flush would erase subject-self-role(dx),
+# strand the rr grant, and leave dx ALLOWED — a fail-OPEN this asserts against.
+statement ok
+DELETE FROM __birdshot_grants WHERE grantee = 'dx' AND stmt LIKE '%main.drift%';
+
+statement ok
+UPDATE __birdshot_meta SET epoch = 2;
+
+query I
+SELECT birdshot_authorize('hsdx', 'SELECT id FROM main.drift');
 ----
 false

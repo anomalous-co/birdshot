@@ -165,6 +165,39 @@ void State::MarkGranteeKeyApplied(const std::string &key) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	applied_grantee_keys_.insert(key);
 }
+int64_t State::HydratedEpoch() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return hydrated_epoch_;
+}
+void State::SetHydratedEpoch(int64_t epoch) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	hydrated_epoch_ = epoch;
+}
+void State::MarkHydratedRoleKey(const std::string &role_key) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	hydrated_role_keys_.insert(role_key);
+}
+void State::FlushHydrated() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	// Erase ONLY the hydrated grant state, keyed by the role_keys hydration APPLY actually
+	// wrote (hydrated_role_keys_, recorded from the g/gc/r/rc ops). This is deliberately NOT
+	// a re-translation of the store (kind,grantee) columns: apply keys a grant by the stmt's
+	// TO clause, so if the columns ever drift from the TO clause (a writer-contract
+	// violation) a column-based flush would erase the WRONG key, leave the real grant behind,
+	// and fail OPEN on the very REVOKE this gate exists to enforce (§12d). Erasing exactly the
+	// applied role_keys makes that drift structurally incapable of stranding a live grant.
+	// Only g/gc write role_grants/role_constraints; user_roles (membership) is intentionally
+	// preserved (re-hydrate re-adds edges idempotently, appended `REVOKE ROLE` rows undo stale
+	// ones). Scalar config (auth/JWKS/tokens/lake/*_policies) is never touched.
+	for (const auto &role_key : hydrated_role_keys_) {
+		live_.role_grants.erase(role_key);
+		live_.role_constraints.erase(role_key);
+	}
+	hydrated_role_keys_.clear();
+	applied_grantee_keys_.clear();
+	hydrated_subjects_.clear();
+	poisoned_subjects_.clear();
+}
 void State::AddSourcePolicy(const std::string &role, const std::string &pattern) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	staging_.source_policies[role].push_back({pattern});
@@ -620,6 +653,13 @@ static void SetStrResult(Vector &result, idx_t i, const std::string &s) {
 // applies them to live State so authorize stays a pure in-memory read.
 static void HydrateSubject(ClientContext &ctx, const std::string &sub);
 
+// §12d freshness gate. Reads the single-row store epoch from __birdshot_meta on
+// birdshot's trusted internal connection (catalog-qualified like the grant pull, §12h).
+// Returns false on ANY failure (missing table / query error / zero rows / NULL) so
+// table-mode Authorize can fail CLOSED — epoch is REQUIRED in table mode; there is
+// deliberately no "is freshness active" discriminator (that would be a fail-open trap).
+static bool ReadStoreEpoch(ClientContext &ctx, int64_t &out);
+
 // birdshot_authenticate(sid, token, server_token) -> BOOLEAN
 static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result) {
 	args.data[0].Flatten(args.size());
@@ -640,11 +680,9 @@ static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result
 		//    quack federation token keeps working after birdshot takes over auth.
 		std::string svc_user;
 		if (st.LookupServiceToken(token, svc_user)) {
+			// §12d: hydration is now lazy-on-authorize (the freshness gate ensure_hydrates
+			// each subject on every authorize), so authenticate only binds the session.
 			st.PutSession(sid, Identity {svc_user, "", 0});
-			if (state.HasContext())
-				HydrateSubject(state.GetContext(), svc_user);
-			else if (st.GrantStoreKind() == "table")
-				st.PoisonSubject(svc_user); // can't reach the store -> fail closed
 			e.user_id = svc_user;
 			e.decision = "allow";
 			e.reason = "service_token";
@@ -656,11 +694,8 @@ static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result
 		// 2. User JWT.
 		Claims c = VerifyJwt(token, st, now);
 		if (c.ok) {
+			// §12d: hydration is lazy-on-authorize; authenticate only binds the session.
 			st.PutSession(sid, Identity {c.sub, c.jti, c.exp_us});
-			if (state.HasContext())
-				HydrateSubject(state.GetContext(), c.sub);
-			else if (st.GrantStoreKind() == "table")
-				st.PoisonSubject(c.sub); // can't reach the store -> fail closed
 			e.user_id = c.sub;
 			e.decision = "allow";
 			e.reason = "ok";
@@ -922,8 +957,49 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 		std::string reason;
 
 		Identity id;
-		if (!st.GetSession(sid, id)) {
+		bool have_session = st.GetSession(sid, id);
+		// §12d FRESHNESS GATE (table mode only): validate the in-memory cache against the
+		// store epoch on EVERY authorize so a store-side REVOKE/GRANT change takes effect.
+		// The flush is GLOBAL but re-hydrate is PER-SUBJECT, and the two are deliberately
+		// SPLIT: when the epoch advances, FlushHydrated() drops the WHOLE hydrated cache
+		// (A's, B's, shared-role, PUBLIC keys) and the epoch is bumped ONCE; HydrateSubject
+		// then runs on EVERY authorize (below the epoch branch), re-populating each subject
+		// lazily. Collapsing them — re-hydrating only the current subject inside the bump
+		// branch — would silently strand every OTHER live session (they'd see
+		// epoch==hydrated, skip the flush, and never get their erased keys re-applied). This
+		// makes hydration lazy-on-authorize, so the Authenticate-time call is now redundant
+		// and has been removed. FAIL-CLOSED: any epoch-read failure denies THIS call via a
+		// dedicated reason (freshness_unavailable) — it must NOT poison (HydrateSubject
+		// short-circuits on an already-hydrated subject BEFORE clearing poison, so poisoning
+		// here on a transient read failure could stick closed until the next epoch bump).
+		// Hoisted out of the deny-chain condition (no GNU statement-expression) so it stays
+		// MSVC-portable and the gate reads top-to-bottom in this security-critical path.
+		bool freshness_ok = true;
+		if (have_session && st.GrantStoreKind() == "table") {
+			if (!state.HasContext()) {
+				freshness_ok = false; // no ClientContext -> can't reach store -> deny
+			} else {
+				int64_t store_epoch = 0;
+				if (!ReadStoreEpoch(state.GetContext(), store_epoch)) {
+					freshness_ok = false; // epoch REQUIRED in table mode -> fail closed
+				} else {
+					if (store_epoch > st.HydratedEpoch()) {
+						st.FlushHydrated(); // GLOBAL: cold the whole cache once
+						st.SetHydratedEpoch(store_epoch);
+					}
+					// PER-SUBJECT ensure_hydrated: no-op if already hydrated, otherwise
+					// re-pulls this subject's current store rows (self-locks its apply;
+					// FlushHydrated already released the State lock, so the brief flushed-
+					// but-not-yet-repopulated window a concurrent authorize may observe reads
+					// empty == denies == fail-safe).
+					HydrateSubject(state.GetContext(), id.user_id);
+				}
+			}
+		}
+		if (!have_session) {
 			reason = "no_session";
+		} else if (!freshness_ok) {
+			reason = "freshness_unavailable"; // §12d fail-closed: store epoch unreadable
 		} else if (st.SubjectPoisoned(id.user_id)) {
 			// §12b fail-closed: grant-store hydration failed for this subject at
 			// authenticate (store unreachable / query error / unparseable row). The
@@ -1887,18 +1963,8 @@ static void GrantSplit(const std::string &s, char delim, vector<std::string> &ou
 	}
 }
 
-// Apply the serialized ops to birdshot's live store. Called ONLY from execution.
-// Reserved namespace for a subject's implicit singleton self-role (grantee `TO <subject>`).
-// The leading 0x1D (GROUP SEPARATOR) control byte cannot appear in an admin-defined role
-// name (role names are SQL identifiers / compiler-generated), so a subject id can NEVER
-// collide with a role name. Without this, `GRANT p ON t TO alice` (subject) would write
-// role_grants["alice"] and make subject "alice" a member of role "alice" — so a JWT `sub`
-// equal to an existing admin role name would silently inherit that role's grants
-// (escalation, advisor Finding A). subject ids are attacker-influenceable at some IdPs;
-// role names are admin-chosen; nothing else guarantees them disjoint.
-static std::string SubjectSelfRole(const std::string &subject) {
-	return std::string("\x1d") + "subj:" + subject;
-}
+// SubjectSelfRole() is now header-inline (birdshot_state.hpp, next to PublicRole) so the
+// apply path here and State::FlushHydrated share ONE (kind,grantee) -> role_key mapping.
 
 // Resolve a serialized grantee (flag, name) to its role_key. "1"=subject -> namespaced
 // self-role (collision-proof); "0"=named role -> the name; "p"=PUBLIC -> the reserved
@@ -2014,8 +2080,11 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 			std::string schema = st.GrantStoreSchema();
 			table_ref = "\"" + store_cat + "\".\"" + schema + "\".\"__birdshot_grants\"";
 		}
+		// ORDER BY version so an append-only writer's GRANT then a later REVOKE in the same
+		// key apply in issue order (§12d): the REVOKE's RevokeLive removes the grant only if
+		// it lands AFTER it. version is the monotonic per-mutation counter (§12a).
 		auto prep = con.Prepare("SELECT stmt FROM " + table_ref +
-		                        " WHERE grantee_kind = ? AND grantee = ?");
+		                        " WHERE grantee_kind = ? AND grantee = ? ORDER BY version");
 		if (!prep || prep->HasError()) {
 			st.PoisonSubject(sub);
 			return;
@@ -2096,6 +2165,17 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 					blob += key_ops[k];
 				}
 				BirdshotApplyGrantOps(blob); // Live methods self-lock; do NOT hold a State lock here
+				// Record the role_keys apply actually wrote (same GrantRoleKeyFor mapping the
+				// apply path uses) so FlushHydrated erases EXACTLY these — never a re-translation
+				// of the store columns, which could drift from the stmt's TO clause and fail OPEN
+				// on REVOKE (§12d). g/gc/r/rc all carry (name=f[1], flag=f[2]); gr/rr touch only
+				// user_roles (preserved by flush) so they are skipped.
+				for (const auto &op : key_ops) {
+					vector<std::string> f;
+					GrantSplit(op, '\t', f);
+					if (f.size() >= 3 && (f[0] == "g" || f[0] == "gc" || f[0] == "r" || f[0] == "rc"))
+						st.MarkHydratedRoleKey(GrantRoleKeyFor(f[2], f[1]));
+				}
 				st.MarkGranteeKeyApplied(vkey);
 			}
 
@@ -2108,6 +2188,44 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 	}
 
 	st.MarkSubjectHydrated(sub);
+}
+
+// §12d freshness signal. Reads the single-row store epoch from __birdshot_meta on
+// birdshot's trusted internal connection — the SAME connection/catalog discipline as
+// HydrateSubject's grant pull (§12h): if a catalog named store_catalog_ is ATTACHed the
+// table is fully qualified `<catalog>.<schema>.__birdshot_meta`, otherwise (local backend)
+// the bare name resolves in memory.main. Catalog/schema are birdshot-internal constants
+// (never attacker input) and there are no bound parameters, so a direct Query is safe.
+// FAIL-CLOSED contract (§12d): ANY failure — missing table, prepare/execute error, zero
+// rows, or NULL epoch — returns false, and the caller denies this authorize. There is no
+// attempt to distinguish "meta table absent" from "store unreachable" (that discriminator
+// is a fail-OPEN trap). TODO(perf): reuse one long-lived internal connection instead of
+// opening one per authorize — correctness first (advisor-sequenced).
+static bool ReadStoreEpoch(ClientContext &ctx, int64_t &out) {
+	auto &st = State::Get();
+	try {
+		duckdb::Connection con(*ctx.db);
+		std::string store_cat = st.GrantStoreCatalog();
+		std::string table_ref = "__birdshot_meta";
+		if (!store_cat.empty() && Catalog::GetCatalogEntry(ctx, store_cat)) {
+			std::string schema = st.GrantStoreSchema();
+			table_ref = "\"" + store_cat + "\".\"" + schema + "\".\"__birdshot_meta\"";
+		}
+		auto res = con.Query("SELECT epoch FROM " + table_ref);
+		if (!res || res->HasError())
+			return false;
+		auto chunk = res->Fetch();
+		if (!chunk || chunk->size() == 0)
+			return false; // zero rows == read failure -> fail closed
+		chunk->Flatten();
+		Value v = chunk->GetValue(0, 0);
+		if (v.IsNull())
+			return false; // NULL epoch == read failure -> fail closed
+		out = v.GetValue<int64_t>();
+		return true;
+	} catch (...) {
+		return false; // any store/exec error -> fail closed
+	}
 }
 
 static duckdb::unique_ptr<FunctionData> BirdshotGrantExecBind(ClientContext &, TableFunctionBindInput &input,

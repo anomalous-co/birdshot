@@ -237,6 +237,16 @@ inline std::string PublicRole() {
 	return std::string("\x1d") + "public";
 }
 
+// SubjectSelfRole() namespaces a subject's implicit singleton self-role (grantee
+// `TO <subject>`). The leading 0x1D means a JWT `sub` equal to an admin-defined role
+// name can NEVER inherit that role's grants (escalation, advisor Finding A). Header-inline
+// (like PublicRole) so BOTH the apply path (namespace duckdb) and State::FlushHydrated
+// (namespace birdshot) map (kind,grantee) -> role_key through the SAME code — a divergent
+// copy would erase the wrong key on flush and fail OPEN on REVOKE (§12d).
+inline std::string SubjectSelfRole(const std::string &subject) {
+	return std::string("\x1d") + "subj:" + subject;
+}
+
 // A finer-grained constraint attached to a role, scoped to one table. Layered on
 // top of the coarse table grant above: a column allow-list and a UTC time window.
 // (Row caps are NOT enforced by birdshot — a boolean authz hook can't truncate a
@@ -435,6 +445,33 @@ public:
 	bool SubjectPoisoned(const std::string &sub);
 	bool GranteeKeyApplied(const std::string &key);
 	void MarkGranteeKeyApplied(const std::string &key);
+	// Records a role_key that hydration APPLY actually wrote (from a g/gc/r/rc op), so
+	// FlushHydrated erases exactly what was applied — not a re-translation of the store
+	// (kind,grantee) columns, which could drift from the stmt's TO clause and strand a live
+	// grant past a REVOKE (fail-OPEN on the very operation the freshness gate enforces).
+	void MarkHydratedRoleKey(const std::string &role_key);
+
+	// ---- freshness gate (spec §12d) ------------------------------------------
+	// The store's monotonic epoch (single-row __birdshot_meta) is the freshness signal:
+	// birdshot records the epoch it last flushed-and-rehydrated at. When the store epoch
+	// advances past this, Authorize FlushHydrated()es the whole hydrated cache and bumps
+	// this, then re-hydrates each subject lazily (per-authorize). Lives OUTSIDE the
+	// swappable snapshot (like the store config); reset/commit never touch it.
+	int64_t HydratedEpoch();
+	void SetHydratedEpoch(int64_t epoch);
+	// Drops ONLY the hydrated grant state so the next per-subject ensure_hydrated re-pulls
+	// the current store rows: for every applied (kind,grantee) key, erase its role-keyed
+	// entry from role_grants AND role_constraints, then clear applied_grantee_keys_,
+	// hydrated_subjects_, and poisoned_subjects_. It MUST NOT touch scalar-pushed config
+	// (auth / JWKS / service tokens / lake catalog / user_roles / *_policies) — in
+	// store-backed mode there is no scalar *grant* overlap, so erasing only hydrated keys
+	// is safe. (Transition caveat: if scalar grants and a store ever coexist, a scalar
+	// grant sharing a role_key with a hydrated one would be collaterally dropped here.)
+	// The role membership map (user_roles) is deliberately preserved; a hydration-added
+	// membership edge is corrected on re-hydrate ONLY if its revoke is written as an
+	// appended `REVOKE ROLE` row — a membership revoke done by ROW DELETION on a role with
+	// other members would leave a stale edge (§12f HARD WRITER OBLIGATION).
+	void FlushHydrated();
 
 	// ---- sessions (authenticate writes, authorize reads) ---------------------
 	void PutSession(const std::string &sid, Identity id);
@@ -488,6 +525,8 @@ private:
 	std::set<std::string> hydrated_subjects_;    // §12c: subjects already lazy-pulled
 	std::set<std::string> poisoned_subjects_;    // §12b: hydration failed -> deny at authorize
 	std::set<std::string> applied_grantee_keys_; // apply-once dedup: (kind,grantee) already applied
+	std::set<std::string> hydrated_role_keys_;   // §12d: role_keys apply wrote -> FlushHydrated target
+	int64_t hydrated_epoch_ = 0;                 // §12d: store epoch last flushed-and-rehydrated at
 
 	std::unordered_map<std::string, Identity> sessions_;
 	std::deque<std::string> session_order_; // insertion order for FIFO eviction
