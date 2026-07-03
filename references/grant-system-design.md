@@ -589,6 +589,22 @@ fails OPEN** — the whole reason this is mandatory.
   outage denies queries — correctness over availability, accepted; a bounded last-known-good grace is a
   §7 option, default off).
 
+**Provisional decisions (2026-07-02, chosen while the user was away — revisit on request):**
+- *Cadence* = **strong per-query epoch**: every authorize does a cheap single-row epoch read on the
+  store's internal connection; re-hydrate the subject only when the epoch advanced. Literal "up to date."
+  Perf optimization (epoch cached ≤T, or PG `LISTEN/NOTIFY`) is future work, not a semantics change.
+- *Store outage* = **fail-closed (deny)** — no grace window by default (consistent with the fail-closed
+  ethos everywhere else in birdshot). A bounded grace stays a §7 opt-in.
+
+### 12h. Postgres-backend store location — hydration must target the store catalog  (phase 3.5)
+The phase-2+3 hydration query is **unqualified** (`SELECT stmt FROM __birdshot_grants`), which resolves
+only for the LOCAL backend (table in the default `memory.main`). For the production **Postgres backend**
+the store table lives in the ATTACHed protected catalog (`__birdshot.<schema>.__birdshot_grants`), so
+the query must be **catalog-qualified by `store_catalog_`** — WITHOUT putting the store catalog in the
+agent search path (that would expose it to wire queries). Proven end-to-end by a **pglite harness**
+(reuses `packages/db/src/stack.ts`'s `PGLiteSocketServer` → DuckDB `ATTACH … AS __birdshot (TYPE
+postgres)`). This is the prerequisite for phase 4 (the epoch lives in the same Postgres store).
+
 ### 12e. Drop windows  (bad state: silently widening a windowed grant to 24/7)
 birdshot stops enforcing time-of-day windows; retire the window params of `birdshot_add_grant_constraint`
 (columns stay — they live in the GRANT SQL and are enforced via the existing `gc`-constraint path).
