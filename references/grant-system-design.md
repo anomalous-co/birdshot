@@ -693,6 +693,44 @@ over-grants, but silently denies legitimate access):**
    cadence is a perf optimization, not a semantics change (future).
 5. **Control-plane rewrite** (12f) + **drop windows** (12e).
 
+## 13. THE PIVOT — one representation: literal GRANT/DENY SQL, no compiler (2026-07-02, user-directed)
+
+The user challenged the whole intermediate layer: *"why are we doing any compilation? what is being
+compiled?"* and *"the goal is for the ui to show the literal grant sql text of the agent's key."* The
+answer: nothing should be compiled. `policy-compiler.ts` exists only to translate the OLD structured
+`acl_rule` model (`{schema,table,columns,verb,effect,priority,ttl}`) into birdshot's snapshot tuples.
+If grants ARE literal GRANT/DENY SQL, that intermediate has no reason to exist.
+
+**Decision (locked): GRANT/DENY SQL is the SINGLE representation end to end** — authored (a tool/UI
+builds the string; not a pipeline), stored (`__birdshot_grants`), enforced (birdshot pull + freshness),
+and DISPLAYED (the UI renders an agent key's literal `stmt` rows). What the compiler did either
+disappears or is native: precedence/deny-wins → `GRANT`/`REVOKE`/`DENY` ordered by version; wildcard
+expansion → native `ON ALL TABLES IN SCHEMA`; agent fan-out → role membership; vocabulary mapping →
+gone. Consciously dropped: compile-time TTL (a store/writer concern) and windows (already dropped).
+
+- **Granular privileges REPLACE the coarse `read/write/create/drop/alter/detach` enum** (user: *"we want
+  granular control … a replacement, not an extension"*). The vocabulary is birdshot's enforced set —
+  `SELECT/INSERT/UPDATE/DELETE/TRUNCATE/CREATE/DROP/ALTER/USAGE/EXECUTE` (+`DETACH`). No `write→ALL
+  PRIVILEGES` umbrella; an admin grants the specific privilege, and the UI shows exactly that.
+- **DENY, deny-wins** preserves "allow `sales.*` but deny `sales.pii`" as one literal line WITH
+  future-table coverage (birdshot is otherwise allow-only; a `REVOKE` can't dent a wildcard pattern).
+  Built: `DENY`/`UNDENY` statements → `d`/`ud` ops → `live_.role_denies` (keyed like grants); a use is
+  authorized iff *(a GRANT matches) AND (no DENY matches)*, enforced in BOTH planes; denies hydrate +
+  flush on the epoch exactly like grants. Deny match = `RefMatch ∧ KindMatch ∧ Covers`; a deny on ANY
+  required cap forbids the whole use (fail-safe). Object/ref-level only; column-level DENY deferred.
+
+**FOLLOW-UP (transparency, not enforcement):** a table that is both ungranted AND denied surfaces the
+audit reason `acl:` (grant check fails first), not `deny:`. The decision is identical, but "explicitly
+denied" vs "never granted" are different facts the UI must distinguish — fix the reason precedence when
+the read/display path lands.
+
+**SEQUENCING (advisor): the engine has outrun the control plane.** birdshot now has DENY + granular caps
++ the SQL store + freshness, but NOTHING produces granular GRANT/DENY SQL — the control plane still
+emits coarse `read/write` tuples via the scalar push. The next unit is NOT more engine work: it is the
+compiler teardown + the GRANT/DENY-SQL writer + the "grants for this key" read endpoint — proving ONE
+literal statement flows control-plane → store → hydrate → enforce → UI. Engine polish (DENY audit
+reason, column-level DENY) queues BEHIND that path.
+
 ## Primary sources
 - Capability model / Covers / ParseCapability: `src/birdshot_state.hpp:48-108`
 - Grant / GrantConstraint structs: `src/birdshot_state.hpp:118,128`

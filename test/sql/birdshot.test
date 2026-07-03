@@ -2241,6 +2241,170 @@ SELECT birdshot_authorize('gsess', 'SELECT id FROM main.gwire');
 false
 
 # ==========================================================================
+# Native DENY / UNDENY — deny-wins ACL (spec DENY), standalone (memory mode)
+# ==========================================================================
+#
+# A use is authorized iff (some GRANT matches) AND (no DENY matches). A DENY beats a
+# GRANT regardless of grant specificity (deny-wins-always). DENY is a first-class SQL
+# statement stored/hydrated exactly like GRANT; here we exercise the standalone native
+# path (gsess = grantee1, still memory mode so no store epoch is required).
+
+statement ok
+CREATE SCHEMA sales;
+
+statement ok
+CREATE TABLE sales.orders(id INT, amt INT);
+
+statement ok
+CREATE TABLE sales.pii(id INT, ssn VARCHAR);
+
+# ---- schema-wide GRANT + table DENY (via ROLE r): allow orders, deny pii ------
+# GRANT SELECT ON ALL TABLES IN SCHEMA sales (wildcard *.sales.*) then DENY the pii table.
+query I
+GRANT SELECT ON ALL TABLES IN SCHEMA sales TO ROLE r;
+----
+GRANT
+
+query I
+DENY SELECT ON sales.pii TO ROLE r;
+----
+DENY
+
+query I
+GRANT r TO grantee1;
+----
+GRANT
+
+# member of r: allowed on a non-denied table covered by the schema-wide grant…
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.orders');
+----
+true
+
+# …but DENIED on sales.pii — the DENY overrides the schema-wide grant (deny-wins).
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.pii');
+----
+false
+
+# ---- deny-wins over a MORE-SPECIFIC same-ref grant ---------------------------
+# grantee1 gets an EXACT grant on sales.pii; the ROLE-level DENY still wins.
+query I
+GRANT SELECT ON sales.pii TO grantee1;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.pii');
+----
+false
+
+# ---- UNDENY restores access (the grants are still present) -------------------
+query I
+UNDENY SELECT ON sales.pii FROM ROLE r;
+----
+UNDENY
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.pii');
+----
+true
+
+# ---- deny-wins when GRANT and DENY name the SAME grantee directly ------------
+statement ok
+CREATE TABLE sales.direct(id INT);
+
+query I
+GRANT SELECT ON sales.direct TO grantee1;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.direct');
+----
+true
+
+query I
+DENY SELECT ON sales.direct TO grantee1;
+----
+DENY
+
+# grant present, deny present on the same (grantee, ref) -> DENIED (deny-wins).
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.direct');
+----
+false
+
+query I
+UNDENY SELECT ON sales.direct FROM grantee1;
+----
+UNDENY
+
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.direct');
+----
+true
+
+# ---- PARSE-WALK deny-wins (DDL plane): DENY overrides a DROP grant -----------
+# birdshot_authorize only CHECKS (never executes), so main.gtab survives every call.
+query I
+GRANT DROP ON main.gtab TO grantee1;
+----
+GRANT
+
+query I
+SELECT birdshot_authorize('gsess', 'DROP TABLE main.gtab');
+----
+true
+
+query I
+DENY DROP ON main.gtab TO grantee1;
+----
+DENY
+
+# deny-wins in the PARSE-WALK (DDL) plane, not just the bind-walk.
+query I
+SELECT birdshot_authorize('gsess', 'DROP TABLE main.gtab');
+----
+false
+
+query I
+UNDENY DROP ON main.gtab FROM grantee1;
+----
+UNDENY
+
+query I
+SELECT birdshot_authorize('gsess', 'DROP TABLE main.gtab');
+----
+true
+
+# ---- WIRE-DENY holds for a DENY statement (mandatory security re-check) ------
+# The parser now claims DENY, so a wire-submitted DENY is auto-denied by the same
+# bare-parser-throws gate as a wire GRANT — a token can never author a deny either.
+query I
+SELECT birdshot_authorize('gsess', 'DENY SELECT ON sales.orders TO grantee1');
+----
+false
+
+# …and it was ineffective: grantee1 still reads sales.orders (deny never applied).
+query I
+SELECT birdshot_authorize('gsess', 'SELECT * FROM sales.orders');
+----
+true
+
+# ---- fail-closed: unenforced privilege in a DENY is a hard error -------------
+statement error
+DENY TRIGGER ON sales.orders TO grantee1;
+----
+unknown or unenforced privilege
+
+# ---- deferred: a column list on DENY is out of scope (clear error) -----------
+statement error
+DENY SELECT (ssn) ON sales.pii TO grantee1;
+----
+column lists on DENY
+
+# ==========================================================================
 # Lazy grant-store hydration (spec §12b/§12c) — local-table backend
 # ==========================================================================
 #
@@ -2588,3 +2752,59 @@ query I
 SELECT birdshot_authorize('hsdx', 'SELECT id FROM main.drift');
 ----
 false
+
+# ==========================================================================
+# Hydrated DENY (spec §12) — store-row DENY, deny-wins + flush-on-epoch-bump
+# ==========================================================================
+#
+# A DENY row in __birdshot_grants (grantee_kind/grantee like a GRANT row) is pulled +
+# parsed (parse-only) + applied to role_denies, then enforced deny-wins. And on an epoch
+# bump the whole hydrated cache — role_denies included — is flushed and re-pulled, so a
+# store-side DENY add takes effect (fail-closed) and a store-side DENY delete lifts
+# (proving denies flush; no stale deny lingers). Epoch is at 2 here (dx case above).
+
+statement ok
+CREATE TABLE main.hpii(id INT, ssn VARCHAR);
+
+# alice gets a store GRANT on main.hpii (subject row); bump the epoch so the global flush
+# + per-subject re-hydrate picks it up on her next authorize.
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'GRANT SELECT ON main.hpii TO alice', 3);
+
+statement ok
+UPDATE __birdshot_meta SET epoch = 3;
+
+# Granted, no deny yet -> allowed.
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.hpii');
+----
+true
+
+# ---- store DENY row pulled + enforced (deny-wins over the hydrated grant) -----
+# no-fail-open-on-added-DENY: append a DENY row + bump epoch -> next query DENIES.
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'DENY SELECT ON main.hpii TO alice', 4);
+
+statement ok
+UPDATE __birdshot_meta SET epoch = 4;
+
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.hpii');
+----
+false
+
+# ---- freshness: DELETE the DENY row + bump epoch -> denies FLUSH -> ALLOWS -----
+# Proves FlushHydrated erases role_denies: no appended UNDENY row exists, so the ONLY
+# way the next query allows is the flush dropping the hydrated deny and the re-pull
+# (grant still present, deny gone) restoring access. A deny NOT flushed here would be
+# fail-safe (over-deny) — but it would also break a legitimate lift, so we assert allow.
+statement ok
+DELETE FROM __birdshot_grants WHERE grantee = 'alice' AND stmt LIKE 'DENY%';
+
+statement ok
+UPDATE __birdshot_meta SET epoch = 5;
+
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.hpii');
+----
+true

@@ -191,6 +191,8 @@ void State::FlushHydrated() {
 	// ones). Scalar config (auth/JWKS/tokens/lake/*_policies) is never touched.
 	for (const auto &role_key : hydrated_role_keys_) {
 		live_.role_grants.erase(role_key);
+		live_.role_denies.erase(role_key); // deny-wins ACL: flush hydrated denies too, or a
+		                                   // store-side UNDENY/deletion would fail OPEN (§12d)
 		live_.role_constraints.erase(role_key);
 	}
 	hydrated_role_keys_.clear();
@@ -347,6 +349,46 @@ void State::RevokeLive(const std::string &role, const std::string &resource_ref,
 	                       }),
 	        v.end());
 }
+// Deny-wins ACL: append a Deny to live_.role_denies[role]. Mirror of GrantLive minus the
+// inert delegation fields; cap/kind fail-closed (an unknown string is a no-op, never a deny
+// that could unexpectedly forbid). resource_ref lowercased to match the RefMatch invariant.
+void State::DenyLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+                     const std::string &kind_str) {
+	Capability cap;
+	if (!ParseCapability(cap_str, cap))
+		return; // unknown capability -> fail-closed no-op
+	ObjKind kind;
+	if (!ParseObjKind(kind_str, kind))
+		return; // unknown object kind -> fail-closed no-op
+	std::lock_guard<std::mutex> lk(mtx_);
+	Deny d;
+	d.resource_ref = LowerCopy(resource_ref);
+	d.cap = cap;
+	d.kind = kind;
+	live_.role_denies[role].push_back(d);
+}
+// Inverse of DenyLive: erase every deny on `role` whose (ref, cap, kind) EXACTLY matches —
+// exact-ref (not RefMatch), the inverse of one DenyLive (mirror of RevokeLive).
+void State::UndenyLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+                       const std::string &kind_str) {
+	Capability cap;
+	if (!ParseCapability(cap_str, cap))
+		return; // unknown capability -> nothing could match; safe no-op
+	ObjKind kind;
+	if (!ParseObjKind(kind_str, kind))
+		return;
+	std::string ref = LowerCopy(resource_ref);
+	std::lock_guard<std::mutex> lk(mtx_);
+	auto it = live_.role_denies.find(role);
+	if (it == live_.role_denies.end())
+		return;
+	auto &v = it->second;
+	v.erase(std::remove_if(v.begin(), v.end(),
+	                       [&](const Deny &d) {
+		                       return d.resource_ref == ref && d.cap == cap && d.kind == kind;
+	                       }),
+	        v.end());
+}
 void State::GrantRoleLive(const std::string &subject, const std::string &role) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	auto &roles = live_.user_roles[subject];
@@ -428,6 +470,23 @@ std::vector<Grant> State::GrantsForUser(const std::string &user_id) {
 	// runs unconditionally (do NOT early-return above on the no-roles case).
 	auto pit = live_.role_grants.find(PublicRole());
 	if (pit != live_.role_grants.end())
+		out.insert(out.end(), pit->second.begin(), pit->second.end());
+	return out;
+}
+std::vector<Deny> State::DeniesForUser(const std::string &user_id) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	std::vector<Deny> out;
+	auto it = live_.user_roles.find(user_id);
+	if (it != live_.user_roles.end()) {
+		for (const auto &role : it->second) {
+			auto dit = live_.role_denies.find(role);
+			if (dit != live_.role_denies.end())
+				out.insert(out.end(), dit->second.begin(), dit->second.end());
+		}
+	}
+	// PUBLIC denies apply to every identity too (same merge rule as grants, spec §8d).
+	auto pit = live_.role_denies.find(PublicRole());
+	if (pit != live_.role_denies.end())
 		out.insert(out.end(), pit->second.begin(), pit->second.end());
 	return out;
 }
@@ -622,6 +681,48 @@ static bool UseSatisfied(const TableUse &use, const std::vector<Grant> &grants) 
 			continue; // object-kind gate (spec §1c): a table grant never covers a sequence use
 		if (Covers(g.cap, use.cap))
 			return true;
+	}
+	return false;
+}
+
+// ---- deny-wins (spec DENY) -------------------------------------------------
+//
+// A table use is authorized iff (some GRANT matches) AND (no DENY matches). These
+// answer the "no DENY matches" half. A deny MATCHES a use exactly like a grant covers
+// one — RefMatch on ref AND KindMatch on kind AND Covers on cap — so `DENY WRITE`
+// (umbrella) forbids every narrow DML need (deny broadly = fail-closed), and a deny
+// overrides a grant regardless of grant specificity (deny-wins-always). Callers compute
+// allow first, then apply a matching deny as an override to FORBIDDEN.
+
+// Parse-plane (single-cap TableUse): true iff any deny matches this use.
+static bool UseDenied(const TableUse &use, const std::vector<Deny> &denies) {
+	for (const auto &d : denies) {
+		if (!RefMatch(d.resource_ref, use.ref))
+			continue;
+		if (!KindMatch(d.kind, use.kind))
+			continue;
+		if (Covers(d.cap, use.cap))
+			return true;
+	}
+	return false;
+}
+
+// Bind-plane (multi-cap BoundTableUse): a matching deny on ANY required cap forbids the
+// WHOLE use — you cannot even READ a denied table as part of an `UPDATE … WHERE`. If
+// `hit` is non-null it receives the FIRST denied cap (for the audit reason).
+static bool BoundUseDenied(const BoundTableUse &use, const std::vector<Deny> &denies, Capability *hit = nullptr) {
+	for (Capability need : use.caps) {
+		for (const auto &d : denies) {
+			if (!RefMatch(d.resource_ref, use.ref))
+				continue;
+			if (!KindMatch(d.kind, use.kind))
+				continue;
+			if (Covers(d.cap, need)) {
+				if (hit)
+					*hit = need;
+				return true;
+			}
+		}
 	}
 	return false;
 }
@@ -1038,12 +1139,19 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 				// false). Every catalog target is checked against grants (capability-aware
 				// Covers); every external resource against the role's policy allowlist.
 				auto grants = st.GrantsForUser(id.user_id);
+				auto denies = st.DeniesForUser(id.user_id); // deny-wins ACL (spec DENY)
 				bool all_ok = true;
 				// (a) catalog DDL targets (CREATE/DROP/ALTER/DETACH + COPY-FROM write target).
 				for (const auto &use : pre.cap_uses) {
 					if (!UseSatisfied(use, grants)) {
 						all_ok = false;
 						reason = std::string("acl:") + CapabilityName(use.cap) + ":" + use.ref;
+						break;
+					}
+					// deny-wins: a matching deny overrides the grant -> FORBIDDEN (spec DENY).
+					if (UseDenied(use, denies)) {
+						all_ok = false;
+						reason = std::string("deny:") + CapabilityName(use.cap) + ":" + use.ref;
 						break;
 					}
 				}
@@ -1053,6 +1161,11 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 						if (!UseSatisfied(use, grants)) {
 							all_ok = false;
 							reason = std::string("acl:") + CapabilityName(use.cap) + ":" + use.ref;
+							break;
+						}
+						if (UseDenied(use, denies)) { // deny-wins (spec DENY)
+							all_ok = false;
+							reason = std::string("deny:") + CapabilityName(use.cap) + ":" + use.ref;
 							break;
 						}
 					}
@@ -1136,12 +1249,20 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 				} else {
 					// CHECK: every touched table must be covered by a grant. (`grants`
 					// fetched above for the bind search-path schemas; reuse it.)
+					auto denies = st.DeniesForUser(id.user_id); // deny-wins ACL (spec DENY)
 					bool all_ok = true;
 					for (const auto &use : a.tables) {
 						Capability missing;
 						if (!BoundUseSatisfied(use, grants, &missing)) {
 							all_ok = false;
 							reason = std::string("acl:") + CapabilityName(missing) + ":" + use.ref;
+							break;
+						}
+						// deny-wins: a matching deny on ANY required cap forbids the whole use (spec DENY).
+						Capability dhit;
+						if (BoundUseDenied(use, denies, &dhit)) {
+							all_ok = false;
+							reason = std::string("deny:") + CapabilityName(dhit) + ":" + use.ref;
 							break;
 						}
 					}
@@ -1482,6 +1603,8 @@ static void StatusFn(DataChunk &args, ExpressionState &state, Vector &result) {
 // grantee kind: "1"=subject (namespaced self-role), "0"=named role, "p"=PUBLIC pseudo-role. Codes:
 //   g\t<name>\t<flag>\t<ref>\t<kind>\t<cap>\t<grant_option 0/1>\t<grantor>   grant a privilege
 //   r\t<name>\t<flag>\t<ref>\t<kind>\t<cap>                                 revoke a privilege
+//   d\t<name>\t<flag>\t<ref>\t<kind>\t<cap>                                 deny a privilege (deny-wins)
+//   ud\t<name>\t<flag>\t<ref>\t<kind>\t<cap>                                remove a deny (UNDENY)
 //   gc\t<name>\t<flag>\t<ref>\t<col1,col2,…>                                install/widen a column allow-list
 //   rc\t<name>\t<flag>\t<ref>                                              drop the column allow-list
 //   gr\t<subject>\t<role>                                                  grant role membership
@@ -1646,8 +1769,15 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 	std::string t0 = GrantLower(toks[0]);
 	bool is_grant = (t0 == "grant");
 	bool is_revoke = (t0 == "revoke");
-	if (!is_grant && !is_revoke)
-		return ParserExtensionParseResult(); // not a GRANT/REVOKE — let DuckDB's error stand
+	// Deny-wins ACL (spec DENY). DENY mirrors GRANT (adds a deny, uses TO); UNDENY mirrors
+	// REVOKE (removes a deny, uses FROM). Everything else — privileges, ref, `ON [kind]`,
+	// `ALL … IN SCHEMA`, grantee list (`ROLE`/`PUBLIC`) — reuses the GRANT/REVOKE parsing.
+	bool is_deny = (t0 == "deny");
+	bool is_undeny = (t0 == "undeny");
+	bool is_deny_family = is_deny || is_undeny;
+	bool uses_to = is_grant || is_deny;    // GRANT/DENY … TO …
+	if (!is_grant && !is_revoke && !is_deny && !is_undeny)
+		return ParserExtensionParseResult(); // not ours — let DuckDB's error stand
 	// From here it IS ours: every failure is a DISPLAY_EXTENSION_ERROR (fail-closed).
 	auto err = [](const std::string &m) { return ParserExtensionParseResult("birdshot GRANT: " + m); };
 
@@ -1673,7 +1803,7 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 	if (is_revoke && low.size() >= 4 && low[1] == "grant" && low[2] == "option" && low[3] == "for")
 		return err("REVOKE GRANT OPTION FOR is not supported yet (Phase 3b delegation graph)");
 
-	const std::string kw = is_grant ? "to" : "from"; // GRANT … TO … / REVOKE … FROM …
+	const std::string kw = uses_to ? "to" : "from"; // GRANT/DENY … TO … / REVOKE/UNDENY … FROM …
 	// Locate ON and TO/FROM at PAREN DEPTH 0 so a column list `(c1,c2)` (its commas, and
 	// pathologically an identifier spelled like a keyword) can't be mistaken for structure.
 	int on_idx = -1, kw_idx = -1, depth = 0;
@@ -1695,7 +1825,7 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 			kw_idx = static_cast<int>(i);
 	}
 	if (kw_idx < 0)
-		return err(std::string("expected ") + (is_grant ? "TO" : "FROM"));
+		return err(std::string("expected ") + (uses_to ? "TO" : "FROM"));
 
 	// Trailing clauses after the grantee list: WITH … OPTION / GRANTED BY / CASCADE|RESTRICT.
 	int tail_idx = -1;
@@ -1759,10 +1889,18 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 		}
 	}
 
+	// DENY/UNDENY are object/ref-level only: delegation is meaningless for a deny, so reject
+	// WITH GRANT OPTION / GRANTED BY on a deny (never silently ignore an authoring clause).
+	if (is_deny_family && (grant_option || !grantor.empty()))
+		return err("WITH GRANT OPTION / GRANTED BY are not valid on DENY/UNDENY");
+
 	vector<std::string> ops;
 
 	if (on_idx < 0) {
 		// ---- role membership: GRANT <role> TO <grantees> / REVOKE <role> FROM <grantees> ----
+		// DENY has no role-membership form (deny-wins is object-level); require ON <object>.
+		if (is_deny_family)
+			return err("DENY/UNDENY requires ON <object>; role membership cannot be denied");
 		if (kw_idx != 2)
 			return err("expected a single role name before " + kw);
 		std::string role = toks[1];
@@ -1782,7 +1920,7 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 		if (on_idx <= 1)
 			return err("expected privileges before ON");
 		if (kw_idx <= on_idx)
-			return err(std::string("expected ") + (is_grant ? "TO" : "FROM") + " after the object");
+			return err(std::string("expected ") + (uses_to ? "TO" : "FROM") + " after the object");
 
 		// ---- privileges (each with an OPTIONAL column list): toks(1 .. on_idx) ----------
 		// PG attaches a column list per-privilege (`SELECT (c1,c2)`). birdshot column allow-
@@ -1895,12 +2033,20 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 		if (!col_union.empty() && !(kind == "table" || kind == "view"))
 			return err("column lists apply only to TABLE/VIEW objects");
 
+		// DEFERRED (spec): a column-list on DENY is out of scope — DENY is object/ref-level
+		// only (deny a whole table/ref). Reject fail-closed rather than silently widen to
+		// a whole-object deny. (Column-level deny can be added later parallel to the `gc` path.)
+		if (is_deny_family && !col_union.empty())
+			return err("column lists on DENY/UNDENY are out of scope (object-level DENY only)");
+
 		vector<GrantGrantee> grantees;
 		if (!GrantParseGrantees(toks, static_cast<size_t>(kw_idx) + 1, grantee_end, grantees))
 			return err("malformed grantee list");
 
-		const char *code = is_grant ? "g" : "r";
-		const char *ccode = is_grant ? "gc" : "rc";
+		// Op code: `d`=deny / `ud`=undeny (deny-wins ACL) — SAME 6-field layout as `r`
+		// (name,flag,ref,kind,cap; no grant_option/grantor). `g`=grant (8-field) / `r`=revoke.
+		const char *code = is_deny ? "d" : is_undeny ? "ud" : is_grant ? "g" : "r";
+		const char *ccode = is_grant ? "gc" : "rc"; // column constraints: GRANT/REVOKE only
 		for (const auto &g : grantees) {
 			std::string flag = GranteeFlag(g);
 			for (const auto &cap : caps) {
@@ -1933,7 +2079,8 @@ static ParserExtensionParseResult BirdshotGrantParse(ParserExtensionInfo *, cons
 
 	if (ops.empty())
 		return err("nothing to do");
-	return ParserExtensionParseResult(make_uniq<BirdshotGrantParseData>(is_grant ? "GRANT" : "REVOKE", std::move(ops)));
+	std::string verb = is_deny ? "DENY" : is_undeny ? "UNDENY" : is_grant ? "GRANT" : "REVOKE";
+	return ParserExtensionParseResult(make_uniq<BirdshotGrantParseData>(verb, std::move(ops)));
 }
 
 // ---- the exec table function (mutation happens HERE, at execution) ----------
@@ -2000,6 +2147,17 @@ static void BirdshotApplyGrantOps(const std::string &blob) {
 		} else if (code == "r" && f.size() == 6) {
 			std::string role_key = GrantRoleKeyFor(f[2], f[1]);
 			st.RevokeLive(role_key, f[3], f[5], f[4]);
+			// d\t<name>\t<flag>\t<ref>\t<kind>\t<cap>  (6 fields) — deny-wins ACL (spec DENY)
+		} else if (code == "d" && f.size() == 6) {
+			const std::string &flag = f[2];
+			std::string role_key = GrantRoleKeyFor(flag, f[1]);
+			if (flag == "1")
+				st.GrantRoleLive(f[1], role_key); // attach subject to self-role so DeniesForUser resolves
+			st.DenyLive(role_key, f[3], f[5], f[4]);
+			// ud\t<name>\t<flag>\t<ref>\t<kind>\t<cap>  (6 fields) — remove a deny (UNDENY)
+		} else if (code == "ud" && f.size() == 6) {
+			std::string role_key = GrantRoleKeyFor(f[2], f[1]);
+			st.UndenyLive(role_key, f[3], f[5], f[4]);
 			// gc\t<name>\t<flag>\t<ref>\t<cols_csv>  (5 fields) — column-list constraint (install/widen)
 		} else if (code == "gc" && f.size() == 5) {
 			const std::string &flag = f[2];
@@ -2168,12 +2326,14 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 				// Record the role_keys apply actually wrote (same GrantRoleKeyFor mapping the
 				// apply path uses) so FlushHydrated erases EXACTLY these — never a re-translation
 				// of the store columns, which could drift from the stmt's TO clause and fail OPEN
-				// on REVOKE (§12d). g/gc/r/rc all carry (name=f[1], flag=f[2]); gr/rr touch only
+				// on REVOKE (§12d). g/gc/r/rc/d/ud all carry (name=f[1], flag=f[2]); d/ud key
+				// role_denies (deny-wins ACL) which flush must also drop; gr/rr touch only
 				// user_roles (preserved by flush) so they are skipped.
 				for (const auto &op : key_ops) {
 					vector<std::string> f;
 					GrantSplit(op, '\t', f);
-					if (f.size() >= 3 && (f[0] == "g" || f[0] == "gc" || f[0] == "r" || f[0] == "rc"))
+					if (f.size() >= 3 && (f[0] == "g" || f[0] == "gc" || f[0] == "r" || f[0] == "rc" ||
+					                      f[0] == "d" || f[0] == "ud"))
 						st.MarkHydratedRoleKey(GrantRoleKeyFor(f[2], f[1]));
 				}
 				st.MarkGranteeKeyApplied(vkey);

@@ -223,6 +223,19 @@ struct Grant {
 	std::string grantor;
 };
 
+// ---- Deny (deny-wins ACL) --------------------------------------------------
+//
+// A single (resource, capability) DENY attached to a role. Deny-wins semantics
+// (spec DENY): a table use is authorized iff (some GRANT matches) AND (no DENY
+// matches). A DENY overrides a GRANT regardless of grant specificity. Structurally
+// a Deny is a Grant minus the inert delegation fields (grant_option/grantor make no
+// sense for a deny); ref/cap/kind matching reuses the SAME RefMatch/Covers/KindMatch.
+struct Deny {
+	std::string resource_ref; // normalized ref (lowercased, wildcards as in Grant)
+	Capability cap = Capability::READ;
+	ObjKind kind = ObjKind::TABLE; // object-kind gate, same as Grant
+};
+
 // ---- reserved pseudo-role keys ---------------------------------------------
 //
 // The leading 0x1D (GROUP SEPARATOR) control byte can NEVER appear in an admin-
@@ -300,6 +313,11 @@ struct PolicySnapshot {
 	std::vector<JwkKey> jwks;
 	std::unordered_map<std::string, std::vector<std::string>> user_roles; // user_id -> role ids
 	std::unordered_map<std::string, std::vector<Grant>> role_grants;      // role id -> grants
+	// Deny-wins ACL: role id -> denies (spec DENY). Keyed by the SAME role_key as
+	// role_grants (GrantRoleKeyFor: subject self-role / bare role / PUBLIC), merged for
+	// a subject across self-role + roles + PUBLIC exactly like grants (DeniesForUser). A
+	// matching deny beats any grant, so a use is authorized iff granted AND not denied.
+	std::unordered_map<std::string, std::vector<Deny>> role_denies;       // role id -> denies
 	std::unordered_map<std::string, std::vector<GrantConstraint>> role_constraints; // role id -> constraints
 	// The catalog alias the lake is ATTACHed under (e.g. "lake"). The authz hook
 	// runs on a fresh transient connection where the gateway's `USE <alias>` does
@@ -397,6 +415,17 @@ public:
 	// (not RefMatch) so a REVOKE undoes precisely the grant a prior GRANT added.
 	void RevokeLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
 	                const std::string &kind_str);
+	// Deny-wins ACL (native DENY / UNDENY, spec DENY). DenyLive mirrors GrantLive: it
+	// appends a Deny{ref,cap,kind} to live_.role_denies[role] (cap/kind re-validated
+	// fail-closed via ParseCapability/ParseObjKind — an unknown string is a no-op).
+	// UndenyLive mirrors RevokeLive: it erases every live deny on `role` whose
+	// (resource_ref, cap, kind) EXACTLY matches (exact ref, not RefMatch) — the inverse
+	// of one DenyLive. Reachable ONLY from the trusted-path DENY/UNDENY table function
+	// (the wire authorize path denies DENY-shaped SQL fail-closed, same gate as GRANT).
+	void DenyLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+	              const std::string &kind_str);
+	void UndenyLive(const std::string &role, const std::string &resource_ref, const std::string &cap_str,
+	                const std::string &kind_str);
 	// Role membership (GRANT <role> TO <subject> / REVOKE <role> FROM <subject>).
 	// GrantRoleLive is idempotent (dedups); also used to attach a subject's singleton
 	// self-role so `TO <subject>` grants resolve through GrantsForUser.
@@ -445,7 +474,7 @@ public:
 	bool SubjectPoisoned(const std::string &sub);
 	bool GranteeKeyApplied(const std::string &key);
 	void MarkGranteeKeyApplied(const std::string &key);
-	// Records a role_key that hydration APPLY actually wrote (from a g/gc/r/rc op), so
+	// Records a role_key that hydration APPLY actually wrote (from a g/gc/r/rc/d/ud op), so
 	// FlushHydrated erases exactly what was applied — not a re-translation of the store
 	// (kind,grantee) columns, which could drift from the stmt's TO clause and strand a live
 	// grant past a REVOKE (fail-OPEN on the very operation the freshness gate enforces).
@@ -461,7 +490,8 @@ public:
 	void SetHydratedEpoch(int64_t epoch);
 	// Drops ONLY the hydrated grant state so the next per-subject ensure_hydrated re-pulls
 	// the current store rows: for every applied (kind,grantee) key, erase its role-keyed
-	// entry from role_grants AND role_constraints, then clear applied_grantee_keys_,
+	// entry from role_grants, role_denies (deny-wins ACL — a stale hydrated deny must ALSO
+	// flush so a store-side UNDENY/deletion takes effect) AND role_constraints, then clear applied_grantee_keys_,
 	// hydrated_subjects_, and poisoned_subjects_. It MUST NOT touch scalar-pushed config
 	// (auth / JWKS / service tokens / lake catalog / user_roles / *_policies) — in
 	// store-backed mode there is no scalar *grant* overlap, so erasing only hydrated keys
@@ -487,6 +517,9 @@ public:
 	// Returns a copy of the caller's merged grants (cheap: per-user grant sets
 	// are small). Empty vector => no grants => default deny.
 	std::vector<Grant> GrantsForUser(const std::string &user_id);
+	// Merged denies across the user's self-role + roles + PUBLIC (same union semantics as
+	// GrantsForUser; no dedup). Empty => no denies => grants decide alone (deny-wins, spec DENY).
+	std::vector<Deny> DeniesForUser(const std::string &user_id);
 	// Merged constraints across the user's roles (same union semantics as
 	// GrantsForUser; no dedup). Empty => no constraints.
 	std::vector<GrantConstraint> ConstraintsForUser(const std::string &user_id);
