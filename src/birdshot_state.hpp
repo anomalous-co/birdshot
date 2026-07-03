@@ -456,6 +456,8 @@ public:
 	// `<catalog>.public.<table>`, so this defaults to "public". Lives outside the
 	// swappable snapshot (like the store catalog) so reset/commit never wipe it.
 	std::string GrantStoreSchema();
+	std::string GrantStoreScope();
+	void SetGrantScope(const std::string &scope);
 	// True iff `catalog` (lowercased) is the configured grant-store catalog. Used by
 	// IsProtectedRef so no wire token can address the store catalog.
 	bool IsProtectedCatalog(const std::string &catalog);
@@ -555,6 +557,10 @@ private:
 	std::string store_target_;          // ATTACH target / DSN (table backend)
 	std::string store_catalog_;         // protected catalog alias for the store
 	std::string store_schema_ = "public"; // schema of the store table in the ATTACHed catalog (§12h)
+	std::string store_scope_;             // per-datalake scope: pull/epoch filter `AND datalake = ?`
+	                                      // (empty = no filter — standalone/tests). Set by
+	                                      // birdshot_set_grant_scope so one shared control-DB store
+	                                      // serves many datalakes with tenant isolation.
 	std::set<std::string> hydrated_subjects_;    // §12c: subjects already lazy-pulled
 	std::set<std::string> poisoned_subjects_;    // §12b: hydration failed -> deny at authorize
 	std::set<std::string> applied_grantee_keys_; // apply-once dedup: (kind,grantee) already applied

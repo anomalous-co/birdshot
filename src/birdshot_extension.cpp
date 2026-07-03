@@ -133,6 +133,14 @@ std::string State::GrantStoreSchema() {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return store_schema_;
 }
+std::string State::GrantStoreScope() {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return store_scope_;
+}
+void State::SetGrantScope(const std::string &scope) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	store_scope_ = scope;
+}
 bool State::IsProtectedCatalog(const std::string &catalog) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return !store_catalog_.empty() && catalog == store_catalog_;
@@ -1418,6 +1426,19 @@ static void SetGrantStoreFn(DataChunk &args, ExpressionState &state, Vector &res
 		SetStrResult(result, i, eff);
 	}
 }
+// birdshot_set_grant_scope(datalake) -> 'ok'. Per-datalake tenant scope for a SHARED
+// control-DB store: the hydration pull + epoch read filter `AND datalake = ?`. Empty
+// clears the scope (single-tenant / tests). Set out-of-band by the gateway boot, never
+// by a wire token.
+static void SetGrantScopeFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	args.data[0].Flatten(args.size());
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t i = 0; i < args.size(); i++) {
+		std::string scope = ArgNull(args.data[0], i) ? "" : ArgStr(args.data[0], i);
+		State::Get().SetGrantScope(scope);
+		SetStrResult(result, i, "ok");
+	}
+}
 // birdshot_add_grant_constraint(role, table_ref, columns_csv, window_start, window_end) -> 'ok'
 // Row caps are intentionally absent (see GrantConstraint / contract C1b).
 static void AddGrantConstraintFn(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -2241,8 +2262,13 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 		// ORDER BY version so an append-only writer's GRANT then a later REVOKE in the same
 		// key apply in issue order (§12d): the REVOKE's RevokeLive removes the grant only if
 		// it lands AFTER it. version is the monotonic per-mutation counter (§12a).
+		// Per-datalake scope (prod): one shared control-DB store serves many datalakes, so
+		// the pull filters `AND datalake = ?` (bound, never concatenated). Empty scope
+		// (standalone/tests, store table has no `datalake` column) omits the clause.
+		std::string scope = st.GrantStoreScope();
+		std::string scope_clause = scope.empty() ? "" : " AND datalake = ?";
 		auto prep = con.Prepare("SELECT stmt FROM " + table_ref +
-		                        " WHERE grantee_kind = ? AND grantee = ? ORDER BY version");
+		                        " WHERE grantee_kind = ? AND grantee = ?" + scope_clause + " ORDER BY version");
 		if (!prep || prep->HasError()) {
 			st.PoisonSubject(sub);
 			return;
@@ -2262,6 +2288,8 @@ static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
 			duckdb::vector<Value> params;
 			params.push_back(Value(it.kind));
 			params.push_back(Value(it.kind == "public" ? std::string() : it.grantee));
+			if (!scope.empty())
+				params.push_back(Value(scope));
 			auto res = prep->Execute(params, false);
 			if (!res || res->HasError()) {
 				st.PoisonSubject(sub);
@@ -2371,7 +2399,20 @@ static bool ReadStoreEpoch(ClientContext &ctx, int64_t &out) {
 			std::string schema = st.GrantStoreSchema();
 			table_ref = "\"" + store_cat + "\".\"" + schema + "\".\"__birdshot_meta\"";
 		}
-		auto res = con.Query("SELECT epoch FROM " + table_ref);
+		// Per-datalake scope (prod): the shared meta table has one epoch row per datalake, so
+		// filter `WHERE datalake = ?` (bound). Empty scope (tests) reads the single row.
+		std::string scope = st.GrantStoreScope();
+		duckdb::unique_ptr<duckdb::QueryResult> res;
+		if (scope.empty()) {
+			res = con.Query("SELECT epoch FROM " + table_ref);
+		} else {
+			auto prep = con.Prepare("SELECT epoch FROM " + table_ref + " WHERE datalake = ?");
+			if (!prep || prep->HasError())
+				return false;
+			duckdb::vector<Value> params;
+			params.push_back(Value(scope));
+			res = prep->Execute(params, false);
+		}
 		if (!res || res->HasError())
 			return false;
 		auto chunk = res->Fetch();
@@ -2481,6 +2522,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Register(loader, "birdshot_add_role_grant", {V, V, V}, V, AddRoleGrantFn);
 	Register(loader, "birdshot_add_role_grant_kind", {V, V, V, V}, V, AddRoleGrantKindFn);
 	Register(loader, "birdshot_set_grant_store", {V, V}, V, SetGrantStoreFn);
+	Register(loader, "birdshot_set_grant_scope", {V}, V, SetGrantScopeFn);
 	Register(loader, "birdshot_add_grant_constraint", {V, V, V, V, V}, V, AddGrantConstraintFn);
 	Register(loader, "birdshot_set_lake_catalog", {V}, V, SetLakeCatalogFn);
 	Register(loader, "birdshot_add_user_role", {V, V}, V, AddUserRoleFn);
