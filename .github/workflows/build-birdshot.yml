@@ -1,6 +1,6 @@
 name: Build & Publish Birdshot Extension
 
-# Builds birdshot for every default DuckDB target and publishes to Cloudflare R2.
+# Builds birdshot for every default DuckDB target and publishes to Google Cloud Storage.
 #
 # Build is delegated to DuckDB's official reusable workflow
 # (duckdb/extension-ci-tools) so vcpkg handles OpenSSL + cross-compilation +
@@ -12,7 +12,7 @@ name: Build & Publish Birdshot Extension
 #   linux_amd64, linux_arm64, osx_amd64, osx_arm64,
 #   windows_amd64, windows_amd64_mingw, wasm_mvp, wasm_eh, wasm_threads
 #
-# R2 layout (served via CDN at https://ext.getwaddling.com):
+# GCS layout (gs://waddling-ext; consumed by the gateway image build + deploy-cutover.sh):
 #   native: v1.5.3/<platform>/birdshot.duckdb_extension.gz            (gzip)
 #   wasm:   duckdb-wasm/v1.5.3/<platform>/birdshot.duckdb_extension.wasm
 # The duckdb-wasm/ prefix + .wasm suffix is what the DuckDB-Wasm loader expects.
@@ -28,7 +28,6 @@ permissions:
 
 env:
   DUCKDB_VERSION: v1.5.3
-  R2_BUCKET: waddling-ext
 
 jobs:
   # ── Build all platforms via DuckDB's reusable workflow ───────────────────────
@@ -56,23 +55,41 @@ jobs:
       # every other target (incl. the prod linux_amd64) build and publish regardless.
       reduced_ci_mode: 'disabled'
 
-  # ── Publish every artifact to Cloudflare R2 ──────────────────────────────────
+  # ── Publish every artifact to Google Cloud Storage ───────────────────────────
+  # All waddling infra is GCP (only the UI + DNS are on Cloudflare), so birdshot
+  # extensions live in gs://waddling-ext — NOT the retired Cloudflare R2 CDN at
+  # ext.getwaddling.com (which now 404s through the GCP router). The gateway/workspace
+  # Cloud Run image build + infra/gcp/deploy-cutover.sh bake the linux_amd64 binary
+  # from this bucket.
+  #
+  # ONE-TIME GCP SETUP (governed — run via gcloud/console, NOT this workflow):
+  #   1. bucket:  gcloud storage buckets create gs://waddling-ext --location=us-west1 \
+  #                 --uniform-bucket-level-access --project=<PROJECT>
+  #   2. CI service account with object-admin on the bucket:
+  #        gcloud iam service-accounts create birdshot-ci --project=<PROJECT>
+  #        gcloud storage buckets add-iam-policy-binding gs://waddling-ext \
+  #          --member=serviceAccount:birdshot-ci@<PROJECT>.iam.gserviceaccount.com \
+  #          --role=roles/storage.objectAdmin
+  #   3. Workload Identity Federation (keyless) for this repo — create a WIF pool +
+  #      github-actions provider and let this repo impersonate birdshot-ci.
+  #   4. GitHub repo secrets:
+  #        GCP_WIF_PROVIDER = projects/<N>/locations/global/workloadIdentityPools/<pool>/providers/<prov>
+  #        GCP_CI_SA        = birdshot-ci@<PROJECT>.iam.gserviceaccount.com
   publish:
-    name: Publish to R2
+    name: Publish to GCS
     needs: build
     # always() so a single failed/flaky build leg (e.g. linux_arm64 OOM) does NOT skip
     # publish: it downloads whatever artifacts DID upload and ships them. The publish
     # step still errors if ZERO artifacts are present, so a fully-broken build can't
-    # silently no-op. (Each target overwrites only its own R2 key, so a missing leg
+    # silently no-op. (Each target overwrites only its own object key, so a missing leg
     # leaves that platform's prior artifact in place rather than deleting it.)
     if: always() && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write        # required for keyless Workload Identity Federation
     env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: auto
-      # R2 rejects the default streaming checksum trailer the AWS CLI v2 now sends.
-      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      GCS_BUCKET: waddling-ext
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -80,10 +97,18 @@ jobs:
           path: artifacts
           pattern: birdshot-${{ env.DUCKDB_VERSION }}-extension-*
 
-      - name: Publish to Cloudflare R2
+      - name: Authenticate to Google Cloud (keyless WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_CI_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Publish to GCS
         run: |
           set -euo pipefail
-          ENDPOINT="https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           VERSION="${DUCKDB_VERSION}"
           shopt -s nullglob
 
@@ -92,24 +117,17 @@ jobs:
             arch="${dir#*-extension-}"; arch="${arch%/}"
 
             if [[ "$arch" == wasm_* ]]; then
-              # WASM: served raw at duckdb-wasm/<ver>/<platform>/...wasm.
-              # The browser loader fetches this directly; Cloudflare handles
-              # transfer compression. Content-Type must be application/wasm.
+              # WASM: served raw at duckdb-wasm/<ver>/<platform>/...wasm — the
+              # DuckDB-Wasm loader fetches it directly. Content-Type application/wasm.
               src="${dir}birdshot.duckdb_extension.wasm"
-              dest="s3://${R2_BUCKET}/duckdb-wasm/${VERSION}/${arch}/birdshot.duckdb_extension.wasm"
-              aws s3 cp "$src" "$dest" \
-                --endpoint-url "$ENDPOINT" \
-                --content-type "application/wasm" \
-                --no-progress
+              dest="gs://${GCS_BUCKET}/duckdb-wasm/${VERSION}/${arch}/birdshot.duckdb_extension.wasm"
+              gcloud storage cp "$src" "$dest" --content-type="application/wasm"
             else
               # Native: gzip then upload to <ver>/<platform>/...gz.
               src="${dir}birdshot.duckdb_extension"
               gzip -c "$src" > /tmp/${arch}.gz
-              dest="s3://${R2_BUCKET}/${VERSION}/${arch}/birdshot.duckdb_extension.gz"
-              aws s3 cp "/tmp/${arch}.gz" "$dest" \
-                --endpoint-url "$ENDPOINT" \
-                --content-type "application/octet-stream" \
-                --no-progress
+              dest="gs://${GCS_BUCKET}/${VERSION}/${arch}/birdshot.duckdb_extension.gz"
+              gcloud storage cp "/tmp/${arch}.gz" "$dest" --content-type="application/octet-stream"
             fi
             echo "Published: ${dest}"
             published=$((published + 1))
@@ -124,18 +142,11 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "## Birdshot published to R2 (${PUBLISHED_COUNT} targets)"
+            echo "## Birdshot published to GCS (${PUBLISHED_COUNT} targets → gs://${GCS_BUCKET})"
             echo ""
-            echo "**Native install:**"
-            echo '```sql'
-            echo "SET allow_unsigned_extensions = true;"
-            echo "INSTALL birdshot FROM 'https://ext.getwaddling.com';"
-            echo "LOAD birdshot;"
-            echo '```'
+            echo "Native: \`gs://${GCS_BUCKET}/${DUCKDB_VERSION}/<platform>/birdshot.duckdb_extension.gz\`"
+            echo "Wasm:   \`gs://${GCS_BUCKET}/duckdb-wasm/${DUCKDB_VERSION}/<platform>/birdshot.duckdb_extension.wasm\`"
             echo ""
-            echo "**DuckDB-Wasm** (autoloads from custom repo):"
-            echo '```sql'
-            echo "SET custom_extension_repository = 'https://ext.getwaddling.com';"
-            echo "LOAD birdshot;"
-            echo '```'
+            echo "The gateway/workspace Cloud Run image build + \`infra/gcp/deploy-cutover.sh\` bake the"
+            echo "linux_amd64 binary from this bucket (\`gcloud storage cp gs://${GCS_BUCKET}/...\`)."
           } >> "$GITHUB_STEP_SUMMARY"
