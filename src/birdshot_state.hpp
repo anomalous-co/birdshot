@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -415,6 +416,21 @@ public:
 	// IsProtectedRef so no wire token can address the store catalog.
 	bool IsProtectedCatalog(const std::string &catalog);
 
+	// ---- lazy hydration bookkeeping (spec §12b/§12c) -------------------------
+	// These live OUTSIDE the swappable snapshot (like the store config): ResetStaging /
+	// Commit do not touch them. A subject is "hydrated" once its grant rows have been
+	// pulled from the store; "poisoned" if that pull failed (fail-closed — authorize
+	// DENIES a poisoned subject). `applied_grantee_keys_` makes each (kind,grantee) row-
+	// set apply to live State AT MOST ONCE process-wide, so a shared PUBLIC/role key does
+	// not accumulate a duplicate GrantLive per authenticating subject (GrantLive appends).
+	bool SubjectHydrated(const std::string &sub);
+	void MarkSubjectHydrated(const std::string &sub);
+	void PoisonSubject(const std::string &sub);
+	void UnpoisonSubject(const std::string &sub);
+	bool SubjectPoisoned(const std::string &sub);
+	bool GranteeKeyApplied(const std::string &key);
+	void MarkGranteeKeyApplied(const std::string &key);
+
 	// ---- sessions (authenticate writes, authorize reads) ---------------------
 	void PutSession(const std::string &sid, Identity id);
 	bool GetSession(const std::string &sid, Identity &out);
@@ -463,6 +479,9 @@ private:
 	std::string store_kind_ = "memory"; // "memory" | "table"
 	std::string store_target_;          // ATTACH target / DSN (table backend)
 	std::string store_catalog_;         // protected catalog alias for the store
+	std::set<std::string> hydrated_subjects_;    // §12c: subjects already lazy-pulled
+	std::set<std::string> poisoned_subjects_;    // §12b: hydration failed -> deny at authorize
+	std::set<std::string> applied_grantee_keys_; // apply-once dedup: (kind,grantee) already applied
 
 	std::unordered_map<std::string, Identity> sessions_;
 	std::deque<std::string> session_order_; // insertion order for FIFO eviction

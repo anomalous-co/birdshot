@@ -527,10 +527,14 @@ Each subsection below names the bad state it prevents.
 ### 12a. Storage form — raw GRANT SQL keyed by grantee  (bad state: subject collision / cross-lang drift)
 Store table `__birdshot_grants` (protected — §0, §10). Cross-language contract (TS writer ⇄ C++ reader,
 byte-for-byte):
-- `grantee TEXT` — the identity the statement targets, in birdshot's **namespaced** key space: a subject
-  → `SubjectSelfRole(sub)` (`\x1d`+`subj:`+id), an admin role → the bare role name, PUBLIC →
-  `PublicRole()` (`\x1dpublic`). This is the **lazy-pull lookup key**; it MUST be computed identically on
-  both sides or a token silently gets the wrong grants (Finding-A class escalation).
+- `grantee_kind TEXT` + `grantee TEXT` — the identity the statement targets, as an **explicit
+  discriminator** (`'subject'` | `'role'` | `'public'`) plus the raw id. birdshot maps `(kind, grantee)`
+  to its INTERNAL namespaced State key (`SubjectSelfRole(sub)` / bare role name / `PublicRole()`); the
+  `\x1d` control bytes stay birdshot-internal and never appear in the store (so the table is
+  human-readable, SQL-testable, and the TS writer needs no knowledge of the control-byte scheme). The
+  discriminator is what prevents the Finding-A collision (a subject and a role sharing a name pull
+  DISTINCT row sets: `WHERE grantee_kind='subject' AND grantee=?` vs `…='role'…`). Pull for a token =
+  its `subject` rows ∪ `public` rows ∪ (transitively) each granted `role`'s rows.
 - `stmt TEXT` — the raw `GRANT …` / `REVOKE …` string.
 - `version BIGINT` (monotonic, bumped on every mutation) — the freshness signal (12d).
 - optional `id`, `revoked_at` for soft-delete + cascade bookkeeping.

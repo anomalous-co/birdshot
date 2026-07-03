@@ -133,6 +133,34 @@ bool State::IsProtectedCatalog(const std::string &catalog) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	return !store_catalog_.empty() && catalog == store_catalog_;
 }
+bool State::SubjectHydrated(const std::string &sub) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return hydrated_subjects_.count(sub) != 0;
+}
+void State::MarkSubjectHydrated(const std::string &sub) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	hydrated_subjects_.insert(sub);
+}
+void State::PoisonSubject(const std::string &sub) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	poisoned_subjects_.insert(sub);
+}
+void State::UnpoisonSubject(const std::string &sub) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	poisoned_subjects_.erase(sub);
+}
+bool State::SubjectPoisoned(const std::string &sub) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return poisoned_subjects_.count(sub) != 0;
+}
+bool State::GranteeKeyApplied(const std::string &key) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	return applied_grantee_keys_.count(key) != 0;
+}
+void State::MarkGranteeKeyApplied(const std::string &key) {
+	std::lock_guard<std::mutex> lk(mtx_);
+	applied_grantee_keys_.insert(key);
+}
 void State::AddSourcePolicy(const std::string &role, const std::string &pattern) {
 	std::lock_guard<std::mutex> lk(mtx_);
 	staging_.source_policies[role].push_back({pattern});
@@ -581,6 +609,13 @@ static void SetStrResult(Vector &result, idx_t i, const std::string &s) {
 
 // ============================ auth / authz hooks ============================
 
+// Lazy grant-store hydration (spec §12b/§12c). Defined after the native GRANT
+// parser/applier it depends on (BirdshotGrantParse / BirdshotApplyGrantOps); forward-
+// declared here so Authenticate can fire it at the handshake. On a "table" store it
+// pulls the subject's GRANT rows (parameterized, parse-only, bounded, fail-closed) and
+// applies them to live State so authorize stays a pure in-memory read.
+static void HydrateSubject(ClientContext &ctx, const std::string &sub);
+
 // birdshot_authenticate(sid, token, server_token) -> BOOLEAN
 static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result) {
 	args.data[0].Flatten(args.size());
@@ -602,6 +637,10 @@ static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result
 		std::string svc_user;
 		if (st.LookupServiceToken(token, svc_user)) {
 			st.PutSession(sid, Identity {svc_user, "", 0});
+			if (state.HasContext())
+				HydrateSubject(state.GetContext(), svc_user);
+			else if (st.GrantStoreKind() == "table")
+				st.PoisonSubject(svc_user); // can't reach the store -> fail closed
 			e.user_id = svc_user;
 			e.decision = "allow";
 			e.reason = "service_token";
@@ -614,6 +653,10 @@ static void Authenticate(DataChunk &args, ExpressionState &state, Vector &result
 		Claims c = VerifyJwt(token, st, now);
 		if (c.ok) {
 			st.PutSession(sid, Identity {c.sub, c.jti, c.exp_us});
+			if (state.HasContext())
+				HydrateSubject(state.GetContext(), c.sub);
+			else if (st.GrantStoreKind() == "table")
+				st.PoisonSubject(c.sub); // can't reach the store -> fail closed
 			e.user_id = c.sub;
 			e.decision = "allow";
 			e.reason = "ok";
@@ -877,6 +920,12 @@ static void Authorize(DataChunk &args, ExpressionState &state, Vector &result) {
 		Identity id;
 		if (!st.GetSession(sid, id)) {
 			reason = "no_session";
+		} else if (st.SubjectPoisoned(id.user_id)) {
+			// §12b fail-closed: grant-store hydration failed for this subject at
+			// authenticate (store unreachable / query error / unparseable row). The
+			// session is bound but every authorization is DENIED until a successful
+			// re-hydration clears the poison.
+			reason = "hydration_failed";
 		} else if (id.exp_us != 0 && now > id.exp_us) {
 			reason = "expired";
 		} else if (st.IsRevoked(id.user_id, id.jti, now)) {
@@ -1902,6 +1951,140 @@ static void BirdshotApplyGrantOps(const std::string &blob) {
 		}
 		// Any other shape: ignore (fail-closed; parse produced only the shapes above).
 	}
+}
+
+// ---- lazy grant-store hydration (spec §12b/§12c) ---------------------------
+// Called from birdshot_authenticate the first time a token binds subject `sub`. On a
+// "table" store it BFS-pulls sub's grant rows (∪ PUBLIC ∪ transitively each granted
+// role's rows), parses each row through the SAME native path as an interactive GRANT
+// (parse-ONLY — never con.run(stmt)), and applies the result to live State so authorize
+// stays a pure in-memory read. Every failure mode (store unreachable, query error, a row
+// that is not a clean GRANT/REVOKE, depth blowout) FAILS CLOSED: the subject is poisoned
+// and Authorize denies it. The nested Connection is birdshot's trusted internal path —
+// the authorize hook gates only the quack wire, never this connection, so the protected
+// __birdshot_grants is readable here (de-risked) while unaddressable over the wire.
+static void HydrateSubject(ClientContext &ctx, const std::string &sub) {
+	auto &st = State::Get();
+	if (st.GrantStoreKind() != "table")
+		return; // no store configured -> interactive/in-memory mode, unchanged (§12c)
+	if (st.SubjectHydrated(sub))
+		return; // already pulled this subject's grants
+	// NB (TOCTOU, benign): two concurrent authenticate calls for the same fresh subject
+	// can both pass this check and the per-key GranteeKeyApplied guard, double-applying a
+	// key. Same grantee, same semantics — duplicate grants, never an over-grant. A real
+	// serialization (or the phase-4 epoch refresh) would close it; not load-bearing here.
+
+	// Fresh attempt: clear any prior poison so a repaired store can re-hydrate.
+	st.UnpoisonSubject(sub);
+
+	struct Item {
+		std::string kind;    // "subject" | "role" | "public"
+		std::string grantee; // raw id ("" for public)
+		int depth;
+	};
+	const int kMaxDepth = 32; // A∈B,B∈A terminates via `visited`; depth is a runaway guard
+	std::vector<Item> work;
+	work.push_back(Item {"subject", sub, 0});
+	work.push_back(Item {"public", "", 0});
+	std::set<std::string> visited; // cycle detection within this BFS
+
+	try {
+		// Trusted internal connection (NOT the wire path). Parameterized pull only:
+		// `sub`/grantee is attacker-controlled and is NEVER concatenated into SQL.
+		duckdb::Connection con(*ctx.db);
+		auto prep = con.Prepare("SELECT stmt FROM __birdshot_grants WHERE grantee_kind = ? AND grantee = ?");
+		if (!prep || prep->HasError()) {
+			st.PoisonSubject(sub);
+			return;
+		}
+		while (!work.empty()) {
+			Item it = work.back();
+			work.pop_back();
+			if (it.depth > kMaxDepth) {
+				st.PoisonSubject(sub); // pathological role chain -> fail closed
+				return;
+			}
+			std::string vkey = it.kind + std::string("\x1f") + it.grantee;
+			if (visited.count(vkey))
+				continue;
+			visited.insert(vkey);
+
+			duckdb::vector<Value> params;
+			params.push_back(Value(it.kind));
+			params.push_back(Value(it.kind == "public" ? std::string() : it.grantee));
+			auto res = prep->Execute(params, false);
+			if (!res || res->HasError()) {
+				st.PoisonSubject(sub);
+				return;
+			}
+
+			// Collect + parse ALL rows for this key BEFORE applying any (per-key all-or-
+			// nothing: one unparseable row denies the subject without half-applying the key).
+			std::vector<std::string> key_ops;       // serialized grant ops for this key
+			std::vector<std::string> pending_roles; // transitive role memberships discovered
+			bool key_ok = true;
+			while (key_ok) {
+				auto chunk = res->Fetch();
+				if (!chunk || chunk->size() == 0)
+					break;
+				chunk->Flatten();
+				for (idx_t r = 0; r < chunk->size(); r++) {
+					Value v = chunk->GetValue(0, r);
+					if (v.IsNull()) {
+						key_ok = false; // null stmt -> fail closed
+						break;
+					}
+					std::string stmt = StringValue::Get(v);
+					// PARSE-ONLY (§12b): a row that is not a clean GRANT/REVOKE ->
+					// DISPLAY_ORIGINAL_ERROR (non-grant) or DISPLAY_EXTENSION_ERROR
+					// (malformed grant); neither is PARSE_SUCCESSFUL -> fail closed.
+					auto pr = BirdshotGrantParse(nullptr, stmt);
+					if (pr.type != ParserExtensionResultType::PARSE_SUCCESSFUL || !pr.parse_data) {
+						key_ok = false;
+						break;
+					}
+					auto &pd = static_cast<BirdshotGrantParseData &>(*pr.parse_data);
+					for (const auto &op : pd.ops) {
+						key_ops.push_back(op);
+						// role membership op "gr\t<subject>\t<role>" -> pull that role next.
+						if (op.rfind("gr\t", 0) == 0) {
+							vector<std::string> f;
+							GrantSplit(op, '\t', f);
+							if (f.size() == 3)
+								pending_roles.push_back(f[2]);
+						}
+					}
+				}
+			}
+			if (!key_ok) {
+				st.PoisonSubject(sub);
+				return;
+			}
+
+			// Apply keyed to the grantee NAMED in each stmt (BirdshotApplyGrantOps does this),
+			// exactly once process-wide: a shared PUBLIC/role key must not accumulate a
+			// duplicate GrantLive per authenticating subject. Membership edges still come from
+			// each subject's own (always-queried) subject rows, so shared roles resolve.
+			if (!key_ops.empty() && !st.GranteeKeyApplied(vkey)) {
+				std::string blob;
+				for (size_t k = 0; k < key_ops.size(); k++) {
+					if (k)
+						blob += "\n";
+					blob += key_ops[k];
+				}
+				BirdshotApplyGrantOps(blob); // Live methods self-lock; do NOT hold a State lock here
+				st.MarkGranteeKeyApplied(vkey);
+			}
+
+			for (const auto &role : pending_roles)
+				work.push_back(Item {"role", role, it.depth + 1});
+		}
+	} catch (...) {
+		st.PoisonSubject(sub); // any store/exec error -> fail closed (never proceed partial)
+		return;
+	}
+
+	st.MarkSubjectHydrated(sub);
 }
 
 static duckdb::unique_ptr<FunctionData> BirdshotGrantExecBind(ClientContext &, TableFunctionBindInput &input,

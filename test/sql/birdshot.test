@@ -2239,3 +2239,179 @@ query I
 SELECT birdshot_authorize('gsess', 'SELECT id FROM main.gwire');
 ----
 false
+
+# ==========================================================================
+# Lazy grant-store hydration (spec §12b/§12c) — local-table backend
+# ==========================================================================
+#
+# A "table" store holds raw GRANT SQL keyed by grantee. birdshot_authenticate
+# lazy-pulls a subject's rows (∪ PUBLIC ∪ transitively each granted role's rows)
+# the FIRST time it binds that subject, parses each row through the native GRANT
+# path (parse-ONLY, never executed), and applies the result to live State — so a
+# subject birdshot has NEVER seen a scalar grant for is enforced on the next
+# authorize. Any store error / unparseable row FAILS CLOSED (subject poisoned ->
+# denied). The store table stays unaddressable to any wire token in BOTH planes.
+
+# Rebuild the protected store fixture with the real cross-language column contract.
+statement ok
+DROP TABLE __birdshot_grants;
+
+statement ok
+CREATE TABLE __birdshot_grants(grantee_kind VARCHAR, grantee VARCHAR, stmt VARCHAR, version BIGINT);
+
+statement ok
+CREATE TABLE main.hyd(id INT, title VARCHAR);
+
+# alice: a direct subject grant (no scalar birdshot_add_role_grant ever ran for her).
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'alice', 'GRANT SELECT ON main.hyd TO alice', 0);
+
+# bob: role membership + the role's own grant -> transitive hydration.
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'bob', 'GRANT r1 TO bob', 0);
+
+statement ok
+INSERT INTO __birdshot_grants VALUES ('role', 'r1', 'GRANT SELECT ON main.hyd TO r1', 0);
+
+# PUBLIC: must reach a subject with no subject/role rows of its own (carol).
+statement ok
+INSERT INTO __birdshot_grants VALUES ('public', '', 'GRANT SELECT ON main.hyd TO PUBLIC', 0);
+
+# mallory: a non-GRANT store row (parser -> DISPLAY_ORIGINAL_ERROR) -> fail-closed poison.
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'mallory', 'DROP TABLE main.hyd', 0);
+
+# mo: a GRANT-shaped but MALFORMED row (parser -> DISPLAY_EXTENSION_ERROR) exercises the
+# OTHER parse-failure branch; must ALSO fail closed even though a VALID grant precedes it
+# in the same key (per-key all-or-nothing: one bad row denies the whole subject).
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'mo', 'GRANT SELECT ON main.hyd TO mo', 0);
+
+statement ok
+INSERT INTO __birdshot_grants VALUES ('subject', 'mo', 'GRANT bogus_priv ON main.hyd TO mo', 0);
+
+# ---- config: service tokens bind sessions to the store subjects -------------
+query I
+SELECT birdshot_reset_config();
+----
+ok
+
+query I
+SELECT birdshot_set_auth('', '', 'dev');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('hy-alice', 'alice');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('hy-bob', 'bob');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('hy-carol', 'carol');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('hy-mallory', 'mallory');
+----
+ok
+
+query I
+SELECT birdshot_add_service_token('hy-mo', 'mo');
+----
+ok
+
+query I
+SELECT birdshot_commit_config();
+----
+ok
+
+# Select the table store AFTER commit. Hydration writes direct-to-live, so no
+# birdshot_commit_config() may follow any authenticate below (it would clobber).
+query I
+SELECT birdshot_set_grant_store('table', ':memory:');
+----
+table
+
+# ---- authenticate triggers the lazy pull (subjects birdshot has never seen) --
+query I
+SELECT birdshot_authenticate('hsa', 'hy-alice', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('hsb', 'hy-bob', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('hsc', 'hy-carol', '');
+----
+true
+
+# mallory / mo still bind a session (fail-closed is enforced at authorize, not here).
+query I
+SELECT birdshot_authenticate('hsm', 'hy-mallory', '');
+----
+true
+
+query I
+SELECT birdshot_authenticate('hso', 'hy-mo', '');
+----
+true
+
+# alice: direct subject grant enforced — proves lazy hydration (no scalar grant existed).
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.hyd');
+----
+true
+
+# bob: transitive role r1 grant enforced.
+query I
+SELECT birdshot_authorize('hsb', 'SELECT id FROM main.hyd');
+----
+true
+
+# carol: only PUBLIC reaches her (no subject/role rows) — still allowed.
+query I
+SELECT birdshot_authorize('hsc', 'SELECT id FROM main.hyd');
+----
+true
+
+# FAIL-CLOSED: mallory's malformed store row poisons her -> DENIED, even though the
+# PUBLIC grant would otherwise cover this exact read.
+query I
+SELECT birdshot_authorize('hsm', 'SELECT id FROM main.hyd');
+----
+false
+
+# FAIL-CLOSED (other branch): mo's malformed GRANT row poisons him -> DENIED, even
+# though a valid `GRANT SELECT ON main.hyd TO mo` sits in the SAME key before it.
+query I
+SELECT birdshot_authorize('hso', 'SELECT id FROM main.hyd');
+----
+false
+
+# A subject with no store rows at all is a clean empty hydration (NOT poison): it is
+# simply un-granted -> default-deny (not a store error).
+query I
+SELECT birdshot_authorize('hsa', 'SELECT id FROM main.nope');
+----
+false
+
+# PROTECTION HOLDS in both planes: a wire token can never read the store table,
+# even the very subject whose grants it holds, and even column-projected.
+query I
+SELECT birdshot_authorize('hsa', 'SELECT * FROM __birdshot_grants');
+----
+false
+
+query I
+SELECT birdshot_authorize('hsa', 'SELECT stmt FROM __birdshot_grants WHERE grantee = ''alice''');
+----
+false
